@@ -3,9 +3,8 @@
 #
 #   ./install.sh root@<device-ip>
 #
-# Files are piped over an ssh session rather than copied with scp: muOS images
-# do not reliably ship an sftp-server, and some regenerate their host key on
-# every boot (if ssh refuses to connect, run `ssh-keygen -R <device-ip>` first).
+# Files are piped over an ssh session rather than copied with scp, so nothing
+# on the device side is required beyond a shell - no sftp-server, no scp binary.
 #
 # Afterwards the device needs a reboot. To undo, see "Undo" in the README.
 
