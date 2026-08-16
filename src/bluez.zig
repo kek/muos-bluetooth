@@ -22,6 +22,29 @@ fn dupz(gpa: std.mem.Allocator, s: [*c]const u8) ![:0]u8 {
     return gpa.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(s))));
 }
 
+/// Builds a `Device` with empty string fields (besides `path`), freeing
+/// whatever it already allocated if a later field fails. Once this returns
+/// successfully the caller owns a fully-formed `Device` with no partial
+/// state left behind to clean up.
+fn makeDevice(gpa: std.mem.Allocator, path: [*c]const u8) !Device {
+    const p = try dupz(gpa, path);
+    errdefer gpa.free(p);
+    const address = try dupz(gpa, "");
+    errdefer gpa.free(address);
+    const alias = try dupz(gpa, "");
+    errdefer gpa.free(alias);
+    const icon = try dupz(gpa, "");
+    errdefer gpa.free(icon);
+    return Device{ .path = p, .address = address, .alias = alias, .icon = icon };
+}
+
+fn freeDevice(gpa: std.mem.Allocator, d: Device) void {
+    gpa.free(d.path);
+    gpa.free(d.address);
+    gpa.free(d.alias);
+    gpa.free(d.icon);
+}
+
 /// Reads org.bluez's whole object tree and returns every org.bluez.Device1.
 /// Reply signature is a{oa{sa{sv}}}: path -> interface -> property -> variant.
 pub fn list(gpa: std.mem.Allocator, conn: dbus.Connection) ![]Device {
@@ -30,7 +53,10 @@ pub fn list(gpa: std.mem.Allocator, conn: dbus.Connection) ![]Device {
     defer c.dbus_message_unref(reply);
 
     var out: std.ArrayList(Device) = .empty;
-    errdefer out.deinit(gpa);
+    errdefer {
+        for (out.items) |d| freeDevice(gpa, d);
+        out.deinit(gpa);
+    }
 
     var top: c.DBusMessageIter = undefined;
     _ = c.dbus_message_iter_init(reply, &top);
@@ -52,12 +78,8 @@ pub fn list(gpa: std.mem.Allocator, conn: dbus.Connection) ![]Device {
             _ = c.dbus_message_iter_next(&ie);
 
             if (c.strcmp(iname, "org.bluez.Device1") == 0) {
-                var d = Device{
-                    .path = try dupz(gpa, path),
-                    .address = try dupz(gpa, ""),
-                    .alias = try dupz(gpa, ""),
-                    .icon = try dupz(gpa, ""),
-                };
+                var d = try makeDevice(gpa, path);
+                errdefer freeDevice(gpa, d);
                 var props: c.DBusMessageIter = undefined;
                 c.dbus_message_iter_recurse(&ie, &props);
                 try readProps(gpa, &props, &d);
@@ -83,15 +105,20 @@ fn readProps(gpa: std.mem.Allocator, props: *c.DBusMessageIter, d: *Device) !voi
 
         if (vtype == c.DBUS_TYPE_STRING) {
             const v = dbus.iterString(&variant);
+            // Dupe the new value before freeing the old one: if dupz fails,
+            // `d` must stay in a fully-valid, freeable state (see makeDevice).
             if (c.strcmp(key, "Address") == 0) {
+                const new_v = try dupz(gpa, v);
                 gpa.free(d.address);
-                d.address = try dupz(gpa, v);
+                d.address = new_v;
             } else if (c.strcmp(key, "Alias") == 0) {
+                const new_v = try dupz(gpa, v);
                 gpa.free(d.alias);
-                d.alias = try dupz(gpa, v);
+                d.alias = new_v;
             } else if (c.strcmp(key, "Icon") == 0) {
+                const new_v = try dupz(gpa, v);
                 gpa.free(d.icon);
-                d.icon = try dupz(gpa, v);
+                d.icon = new_v;
             }
         } else if (vtype == c.DBUS_TYPE_BOOLEAN) {
             const v = dbus.iterBool(&variant);
@@ -104,11 +131,6 @@ fn readProps(gpa: std.mem.Allocator, props: *c.DBusMessageIter, d: *Device) !voi
 }
 
 pub fn freeList(gpa: std.mem.Allocator, devices: []Device) void {
-    for (devices) |d| {
-        gpa.free(d.path);
-        gpa.free(d.address);
-        gpa.free(d.alias);
-        gpa.free(d.icon);
-    }
+    for (devices) |d| freeDevice(gpa, d);
     gpa.free(devices);
 }
