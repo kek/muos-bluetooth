@@ -249,23 +249,38 @@ const App = struct {
     pending_kind: PendingKind = .connect,
     pending_index: usize = 0,
     pending_is_audio: bool = false,
+    // Task 9 fix round 1, finding I3: the connecting device's own address
+    // (e.g. "AA:BB:CC:DD:EE:FF"), copied - not referenced - at `beginAsync`
+    // time, same reasoning as `pending_is_audio` in the doc comment above:
+    // `app.devices` can be reallocated by a refresh before the connect
+    // finishes, and `pollAutoRoute` needs this well after that can happen.
+    pending_address: [32:0]u8 = std.mem.zeroes([32:0]u8),
     pending_retried: bool = false,
     retry_scheduled: bool = false,
     retry_at_ms: u32 = 0,
 
     // Task 9 auto-route: set by `updatePending` right after a successful
     // connect to an `isAudio()` device. Polled once per frame by
-    // `pollAutoRoute` (never blocks) until either a Bluetooth sink shows up
-    // in `audio.sinks` and gets `setDefault`, or `awaiting_sink_deadline_ms`
-    // passes, whichever comes first.
+    // `pollAutoRoute` (never blocks): tries to match `pending_address`
+    // against a Bluetooth sink until `audio_route_timeout_ms` has elapsed
+    // since `awaiting_sink_started_ms`, at which point it falls back to any
+    // Bluetooth sink once (fix round 1, finding I3) before giving up.
     awaiting_sink: bool = false,
-    awaiting_sink_deadline_ms: u32 = 0,
+    awaiting_sink_started_ms: u32 = 0,
     awaiting_sink_last_poll_ms: u32 = 0,
 
     // Set by `fail` when it fires mid-`.working`; cleared by the frame loop,
     // which refreshes once at the top of the next iteration when it's set.
     // See `fail`'s doc comment (final review, finding I2).
     needs_refresh: bool = false,
+
+    // Task 9 fix round 1, finding I1: the audio tab's analogue of
+    // `needs_refresh` above. `pollAutoRoute` runs every frame regardless of
+    // which tab is open and must not refresh `app.sinks` (or route a
+    // failure through `fail`) directly from the background - it just flags
+    // this, and the frame loop refreshes at the top of its next iteration,
+    // same as `needs_refresh` does for devices.
+    needs_sink_refresh: bool = false,
 
     quit: bool = false,
 };
@@ -280,6 +295,17 @@ fn setStatus(app: *App, msg: [*c]const u8) void {
     const n = @min(s.len, app.status.len - 1);
     @memcpy(app.status[0..n], s[0..n]);
     app.status[n] = 0;
+}
+
+/// Copies `address` into `app.pending_address`, truncating to fit - same
+/// shape as `setStatus`. Called from `beginAsync` (mirroring
+/// `pending_is_audio`), not re-read later from `app.devices[app.pending_index]`,
+/// since a `refreshDevices` between the connect starting and finishing could
+/// reorder or reallocate that list before `pollAutoRoute` ever looks at it.
+fn setPendingAddress(app: *App, address: [:0]const u8) void {
+    const n = @min(address.len, app.pending_address.len - 1);
+    @memcpy(app.pending_address[0..n], address[0..n]);
+    app.pending_address[n] = 0;
 }
 
 /// Extracts the first string argument from a D-Bus error reply's body -
@@ -430,6 +456,7 @@ fn beginAsync(app: *App, kind: PendingKind) void {
     app.pending_kind = kind;
     app.pending_index = app.selected;
     app.pending_is_audio = dev.isAudio();
+    setPendingAddress(app, dev.address);
     app.pending_retried = false;
     app.retry_scheduled = false;
     captureResumeMode(app);
@@ -525,6 +552,11 @@ fn audioAction(app: *App, btn: ui.Button) void {
         .a => {
             if (app.sinks_selected >= app.sinks.len) return;
             audio.setDefault(app.sinks[app.sinks_selected]);
+            // Fix round 1, finding I2: an explicit user choice here must win
+            // over a still-pending auto-route, or `pollAutoRoute` could yank
+            // the default back to the just-connected Bluetooth sink a few
+            // seconds after the user deliberately picked something else.
+            app.awaiting_sink = false;
             refreshSinks(app);
         },
         .l1 => app.tab = .devices,
@@ -667,16 +699,17 @@ fn updatePending(app: *App) void {
             .connect => {
                 refreshDevices(app);
                 if (app.mode == .working) app.mode = app.resume_mode;
-                // Task 9 auto-route: arm the deadline rather than polling
-                // here directly - this function only runs when a `Pending`
-                // just completed, but the sink can take a moment to appear
-                // after BlueZ reports the connect done, so the actual
-                // polling happens once per frame in `pollAutoRoute` for up
-                // to `audio_route_timeout_ms` regardless of what else the
-                // user does in the meantime.
+                // Task 9 auto-route: arm the wait rather than polling here
+                // directly - this function only runs when a `Pending` just
+                // completed, but the sink can take a moment to appear after
+                // BlueZ reports the connect done, so the actual polling
+                // happens once per frame in `pollAutoRoute` for up to
+                // `audio_route_timeout_ms` regardless of what else the user
+                // does in the meantime. `pending_address` was already
+                // captured in `beginAsync`.
                 if (app.pending_is_audio) {
                     app.awaiting_sink = true;
-                    app.awaiting_sink_deadline_ms = ticks +% audio_route_timeout_ms;
+                    app.awaiting_sink_started_ms = ticks;
                     app.awaiting_sink_last_poll_ms = ticks;
                 }
             },
@@ -697,35 +730,99 @@ fn updatePending(app: *App) void {
     }
 }
 
+/// Builds the PipeWire node-name prefix BlueZ derives from a device's own
+/// address - `bluez_output.` followed by the MAC with `:` replaced by `_`
+/// (see audio.zig's parseSinks test data: address `4C:87:5D:FD:3E:42` names
+/// the sink `bluez_output.4C_87_5D_FD_3E_42.1`). Writes into `buf` and
+/// returns the written slice, or null if it doesn't fit (never in practice
+/// at this buffer size, but a bad match is worse than no match).
+fn bluezSinkPrefix(buf: []u8, address: []const u8) ?[]u8 {
+    const prefix = "bluez_output.";
+    if (prefix.len + address.len > buf.len) return null;
+    @memcpy(buf[0..prefix.len], prefix);
+    for (address, 0..) |ch, i| {
+        buf[prefix.len + i] = if (ch == ':') '_' else ch;
+    }
+    return buf[0 .. prefix.len + address.len];
+}
+
+/// Case-insensitive prefix match - BlueZ's own casing for the hex in a sink
+/// name has not been confirmed against `bluez.Device.address`'s casing, so
+/// the comparison can't assume they agree.
+fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    for (needle, 0..) |ch, i| {
+        if (std.ascii.toUpper(haystack[i]) != std.ascii.toUpper(ch)) return false;
+    }
+    return true;
+}
+
 /// Non-blocking half of Task 9's auto-route: called once per frame from the
 /// main loop. Does nothing most frames (either no route is pending, or the
 /// last `pw-dump` check was too recent) - it only actually shells out at
-/// most once every `audio_poll_interval_ms`, and gives up silently once
-/// `awaiting_sink_deadline_ms` passes. A `pw-dump` failure is treated the
-/// same as "no Bluetooth sink yet" and retried on the next tick rather than
-/// routed through `fail`: this runs in the background while the user may be
-/// doing anything else in the UI, and a transient PipeWire hiccup here
-/// shouldn't pop an error modal over whatever they're looking at.
+/// most once every `audio_poll_interval_ms`, computed with wrap-safe `-%`
+/// subtraction throughout (matching `updatePending`'s `retry_at_ms` - Task 9
+/// fix round 1, finding M3) rather than a plain `-`/`>=` that could trap or
+/// misbehave right at the `SDL_GetTicks` rollover.
+///
+/// Matches sinks against `app.pending_address` (the device that was just
+/// connected) rather than taking the first Bluetooth sink found: fix round
+/// 1, finding I3 (team-lead ruling) - with two Bluetooth audio devices
+/// around, an unrelated pre-existing sink taking the very first poll would
+/// silently strand the device the user just connected, which is exactly the
+/// "connected but silent" bug this project exists to fix. Once
+/// `audio_route_timeout_ms` has elapsed with no address match, it falls
+/// back to any Bluetooth sink once - a naming scheme this match doesn't
+/// recognise still degrades to the brief's original behaviour instead of
+/// failing shut.
+///
+/// A `pw-dump` failure is treated the same as "no Bluetooth sink yet" and
+/// retried on the next tick rather than routed through `fail`: this runs in
+/// the background while the user may be doing anything else in the UI, and
+/// a transient PipeWire hiccup here shouldn't pop an error modal over
+/// whatever they're looking at. A successful route doesn't refresh
+/// `app.sinks` directly either (fix round 1, finding I1) - it sets
+/// `needs_sink_refresh` for the frame loop to pick up, the same structural
+/// pattern `fail` already uses for `needs_refresh`.
 fn pollAutoRoute(app: *App) void {
     if (!app.awaiting_sink) return;
     const ticks = c.SDL_GetTicks();
+    const elapsed = ticks -% app.awaiting_sink_started_ms;
+    const expired = elapsed >= audio_route_timeout_ms;
 
-    if (ticks >= app.awaiting_sink_deadline_ms) {
-        app.awaiting_sink = false;
-        return;
-    }
-    if (ticks - app.awaiting_sink_last_poll_ms < audio_poll_interval_ms) return;
+    if (!expired and ticks -% app.awaiting_sink_last_poll_ms < audio_poll_interval_ms) return;
     app.awaiting_sink_last_poll_ms = ticks;
 
-    const list = audio.sinks(app.gpa) catch return;
+    const list = audio.sinks(app.gpa) catch {
+        if (expired) app.awaiting_sink = false;
+        return;
+    };
     defer audio.freeSinks(app.gpa, list);
 
+    const address = std.mem.sliceTo(&app.pending_address, 0);
+    var prefix_buf: [48]u8 = undefined;
+    const prefix = bluezSinkPrefix(&prefix_buf, address);
+
+    var fallback: ?audio.Sink = null;
     for (list) |s| {
-        if (s.is_bluetooth) {
-            audio.setDefault(s);
-            app.awaiting_sink = false;
-            return;
+        if (!s.is_bluetooth) continue;
+        if (fallback == null) fallback = s;
+        if (prefix) |p| {
+            if (startsWithIgnoreCase(s.name, p)) {
+                audio.setDefault(s);
+                app.awaiting_sink = false;
+                app.needs_sink_refresh = true;
+                return;
+            }
         }
+    }
+
+    if (expired) {
+        if (fallback) |s| {
+            audio.setDefault(s);
+            app.needs_sink_refresh = true;
+        }
+        app.awaiting_sink = false;
     }
 }
 
@@ -768,6 +865,16 @@ fn renderDevices(app: *App) void {
 /// `renderDevices` does, clamped to however many rows fit above the footer.
 fn renderAudio(app: *App) void {
     ui.text(app.ui, 8, 8, "Audio", app.pal.fg);
+
+    // Fix round 1, finding M2: without this, an empty sink list (e.g.
+    // `pw-dump` briefly returning nothing) rendered as a bare heading and
+    // footer with dead space between them - indistinguishable from a UI
+    // that's broken rather than one that's honestly reporting "nothing
+    // here". `renderDevices` has an analogous always-on state line; this
+    // only needs to appear in the one case that would otherwise look wrong.
+    if (app.sinks.len == 0) {
+        ui.text(app.ui, 8, ui.list_origin_y, "(no audio sinks found)", app.pal.dim);
+    }
 
     const footer_h: c_int = 32;
     const rows_c: c_int = @divTrunc(ui.screen_h - ui.list_origin_y - footer_h, ui.row_height);
@@ -894,6 +1001,15 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
         if (app.needs_refresh) {
             app.needs_refresh = false;
             refreshDevices(&app);
+        }
+        // Fix round 1, finding I1: `pollAutoRoute` (below) can complete a
+        // route while the audio tab is already open, showing the stale
+        // pre-route snapshot until something else happened to refresh it -
+        // this is the audio-tab counterpart to `needs_refresh` above, and
+        // is what actually corrects that.
+        if (app.needs_sink_refresh) {
+            app.needs_sink_refresh = false;
+            refreshSinks(&app);
         }
 
         conn.pump();
