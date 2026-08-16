@@ -1,0 +1,4 @@
+sysroot/
+third_party/
+zig-out/
+.zig-cache/
