@@ -210,6 +210,14 @@ const PendingKind = enum { pair, connect };
 const scan_refresh_ms: u32 = 500;
 const connect_retry_delay_ms: u32 = 1000;
 
+// Task 9 auto-route: how often `pollAutoRoute` actually shells out to
+// `pw-dump` while waiting for a just-connected audio device's sink to
+// appear, and how long it waits in total before giving up. 500ms keeps the
+// subprocess count low (at most ~10 over the wait) without making the
+// route feel laggy once the sink does show up; 5s matches the task-9 brief.
+const audio_poll_interval_ms: u32 = 500;
+const audio_route_timeout_ms: u32 = 5000;
+
 /// Owns the bus connection, SDL/font state, the current device list, and
 /// where the user is in the UI. `pending`/`pending_*`/`retry_*` exist so a
 /// `Connect` in flight (see `bluez.connectAsync`) never blocks the frame
@@ -231,6 +239,12 @@ const App = struct {
     // Wall-clock (SDL_GetTicks) of the last scan-driven list refresh.
     last_refresh_ms: u32 = 0,
 
+    // Audio tab: same ownership shape as `devices`/`selected` above (see
+    // `refreshSinks`) - a fresh slice from `audio.sinks` on every reload,
+    // freed before being replaced.
+    sinks: []audio.Sink = &.{},
+    sinks_selected: usize = 0,
+
     pending: ?dbus.Pending = null,
     pending_kind: PendingKind = .connect,
     pending_index: usize = 0,
@@ -238,6 +252,15 @@ const App = struct {
     pending_retried: bool = false,
     retry_scheduled: bool = false,
     retry_at_ms: u32 = 0,
+
+    // Task 9 auto-route: set by `updatePending` right after a successful
+    // connect to an `isAudio()` device. Polled once per frame by
+    // `pollAutoRoute` (never blocks) until either a Bluetooth sink shows up
+    // in `audio.sinks` and gets `setDefault`, or `awaiting_sink_deadline_ms`
+    // passes, whichever comes first.
+    awaiting_sink: bool = false,
+    awaiting_sink_deadline_ms: u32 = 0,
+    awaiting_sink_last_poll_ms: u32 = 0,
 
     // Set by `fail` when it fires mid-`.working`; cleared by the frame loop,
     // which refreshes once at the top of the next iteration when it's set.
@@ -350,6 +373,25 @@ fn refreshDevices(app: *App) void {
     }
 }
 
+/// Re-lists PipeWire sinks, freeing the previous slice first - same
+/// ownership shape as `refreshDevices` and for the same reason: this is the
+/// one place that reloads `app.sinks`, so every caller (tab entry, `setDefault`)
+/// gets the free-before-replace and `sinks_selected` clamp for free instead
+/// of having to remember either at its own call site.
+fn refreshSinks(app: *App) void {
+    const new_list = audio.sinks(app.gpa) catch |e| {
+        fail(app, @errorName(e).ptr);
+        return;
+    };
+    audio.freeSinks(app.gpa, app.sinks);
+    app.sinks = new_list;
+    if (app.sinks.len == 0) {
+        app.sinks_selected = 0;
+    } else if (app.sinks_selected >= app.sinks.len) {
+        app.sinks_selected = app.sinks.len - 1;
+    }
+}
+
 /// Starts an async pair or connect on the currently-selected device: stops
 /// any in-progress scan first (fix round 1, finding I6 - the same
 /// InProgress/"br-connection-busy" race applies to `Pair` as much as
@@ -459,16 +501,32 @@ fn devicesAction(app: *App, btn: ui.Button) void {
             }
         },
         .b => app.quit = true,
-        .r1 => app.tab = .audio,
+        .r1 => {
+            app.tab = .audio;
+            refreshSinks(app);
+        },
         else => {},
     }
 }
 
-/// Audio tab is Task 9's job (rendering sinks, setting the default output).
-/// This stub only owns tab navigation so a user who presses `r1` from the
-/// devices tab isn't stranded on a blank screen before Task 9 lands.
+/// Audio tab actions: move selection, set the selected sink as default, or
+/// return to devices. `setDefault` is best-effort and cannot fail the UI
+/// (see `audio.setDefault`'s doc comment), so unlike `devicesAction` there's
+/// no error path here to route through `fail` - just a refresh afterwards
+/// so the `<- output` marker moves to the new default immediately.
 fn audioAction(app: *App, btn: ui.Button) void {
     switch (btn) {
+        .up => {
+            if (app.sinks_selected > 0) app.sinks_selected -= 1;
+        },
+        .down => {
+            if (app.sinks_selected + 1 < app.sinks.len) app.sinks_selected += 1;
+        },
+        .a => {
+            if (app.sinks_selected >= app.sinks.len) return;
+            audio.setDefault(app.sinks[app.sinks_selected]);
+            refreshSinks(app);
+        },
         .l1 => app.tab = .devices,
         .b => app.quit = true,
         else => {},
@@ -607,12 +665,20 @@ fn updatePending(app: *App) void {
                 // Stays `.working` - a pair-then-connect chain, not done yet.
             },
             .connect => {
-                // TODO(Task 9): when app.pending_is_audio, poll
-                // audio.sinks for up to 5s for a bluetooth sink and
-                // audio.setDefault it here - the auto-routing behaviour
-                // from the task-9 brief.
                 refreshDevices(app);
                 if (app.mode == .working) app.mode = app.resume_mode;
+                // Task 9 auto-route: arm the deadline rather than polling
+                // here directly - this function only runs when a `Pending`
+                // just completed, but the sink can take a moment to appear
+                // after BlueZ reports the connect done, so the actual
+                // polling happens once per frame in `pollAutoRoute` for up
+                // to `audio_route_timeout_ms` regardless of what else the
+                // user does in the meantime.
+                if (app.pending_is_audio) {
+                    app.awaiting_sink = true;
+                    app.awaiting_sink_deadline_ms = ticks +% audio_route_timeout_ms;
+                    app.awaiting_sink_last_poll_ms = ticks;
+                }
             },
         }
         return;
@@ -628,6 +694,38 @@ fn updatePending(app: *App) void {
             fail(app, @errorName(e).ptr);
             return;
         };
+    }
+}
+
+/// Non-blocking half of Task 9's auto-route: called once per frame from the
+/// main loop. Does nothing most frames (either no route is pending, or the
+/// last `pw-dump` check was too recent) - it only actually shells out at
+/// most once every `audio_poll_interval_ms`, and gives up silently once
+/// `awaiting_sink_deadline_ms` passes. A `pw-dump` failure is treated the
+/// same as "no Bluetooth sink yet" and retried on the next tick rather than
+/// routed through `fail`: this runs in the background while the user may be
+/// doing anything else in the UI, and a transient PipeWire hiccup here
+/// shouldn't pop an error modal over whatever they're looking at.
+fn pollAutoRoute(app: *App) void {
+    if (!app.awaiting_sink) return;
+    const ticks = c.SDL_GetTicks();
+
+    if (ticks >= app.awaiting_sink_deadline_ms) {
+        app.awaiting_sink = false;
+        return;
+    }
+    if (ticks - app.awaiting_sink_last_poll_ms < audio_poll_interval_ms) return;
+    app.awaiting_sink_last_poll_ms = ticks;
+
+    const list = audio.sinks(app.gpa) catch return;
+    defer audio.freeSinks(app.gpa, list);
+
+    for (list) |s| {
+        if (s.is_bluetooth) {
+            audio.setDefault(s);
+            app.awaiting_sink = false;
+            return;
+        }
     }
 }
 
@@ -662,12 +760,37 @@ fn renderDevices(app: *App) void {
     ui.text(app.ui, 8, ui.screen_h - 24, "A connect  X forget  Y scan  B exit", app.pal.dim);
 }
 
-/// Placeholder for the audio tab - Task 9 replaces this with the real sink
-/// list and default-output marker.
-fn renderAudioStub(app: *App) void {
+/// Audio tab: lists PipeWire sinks (`audio.sinks`, held in `app.sinks`),
+/// marking the current default with a trailing `<- output` (an ASCII arrow
+/// rather than a Unicode glyph - the theme font's glyph coverage for `←`
+/// hasn't been checked on the real device, and this can't be visually
+/// verified until the owner runs the interactive UI). Scrolls the same way
+/// `renderDevices` does, clamped to however many rows fit above the footer.
+fn renderAudio(app: *App) void {
     ui.text(app.ui, 8, 8, "Audio", app.pal.fg);
-    ui.text(app.ui, 8, ui.list_origin_y, "(audio tab: Task 9)", app.pal.dim);
-    ui.text(app.ui, 8, ui.screen_h - 24, "L1 devices  B exit", app.pal.dim);
+
+    const footer_h: c_int = 32;
+    const rows_c: c_int = @divTrunc(ui.screen_h - ui.list_origin_y - footer_h, ui.row_height);
+    const max_rows: usize = if (rows_c > 0) @intCast(rows_c) else 0;
+
+    var offset: usize = 0;
+    if (max_rows > 0 and app.sinks_selected >= max_rows) offset = app.sinks_selected - max_rows + 1;
+    const end = @min(app.sinks.len, offset + max_rows);
+
+    for (app.sinks[offset..end], 0..) |s, i| {
+        // `s.description` comes from parseSinks' plain `gpa.dupe` (see
+        // audio.zig) - not null-terminated, unlike bluez.Device's fields -
+        // so it has to be copied through a null-terminated stack buffer
+        // before it can go through `ui.listRow`. A description this long
+        // would already run off a 640px-wide row, so silent truncation on
+        // overflow is an acceptable fallback rather than a real loss.
+        var desc_buf: [96:0]u8 = undefined;
+        const desc: [:0]const u8 = std.fmt.bufPrintZ(&desc_buf, "{s}", .{s.description}) catch "(name too long)";
+        const right: [:0]const u8 = if (s.is_default) "<- output" else "";
+        ui.listRow(app.ui, i, offset + i == app.sinks_selected, desc, right, app.pal);
+    }
+
+    ui.text(app.ui, 8, ui.screen_h - 24, "A set as output  L1 devices  B exit", app.pal.dim);
 }
 
 /// BlueZ's own error text (`err.text()` / a reply's detail string) is
@@ -697,7 +820,7 @@ fn render(app: *App) void {
     ui.beginFrame(app.ui, app.pal);
     switch (app.tab) {
         .devices => renderDevices(app),
-        .audio => renderAudioStub(app),
+        .audio => renderAudio(app),
     }
     if (app.mode == .err) renderErrorModal(app);
     ui.endFrame(app.ui);
@@ -754,6 +877,7 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
         bluez.stopScan(conn, &stop_err) catch {};
     };
     defer bluez.freeList(gpa, app.devices);
+    defer audio.freeSinks(gpa, app.sinks);
 
     app.devices = bluez.list(gpa, conn) catch |e| blk: {
         fail(&app, @errorName(e).ptr);
@@ -779,6 +903,7 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
         }
 
         updatePending(&app);
+        pollAutoRoute(&app);
 
         if (app.mode == .scanning) {
             const ticks = c.SDL_GetTicks();
