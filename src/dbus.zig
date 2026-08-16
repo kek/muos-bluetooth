@@ -58,26 +58,48 @@ pub const Pending = struct {
     /// the reply is stolen, so a second `take()` (or a `done()` after this)
     /// sees an already-empty `Pending` instead of touching a freed
     /// `DBusPendingCall`. Returns the reply, which may itself be an error
-    /// message - check with `errorName`. Returns null if already consumed.
+    /// message - check with `errorName`. Returns null if already consumed
+    /// **or if the call has not completed yet** - `dbus_pending_call_steal_
+    /// reply()` asserts completion and aborts the process otherwise (see the
+    /// live crash this guard was added for, below `deinit`), so this no
+    /// longer trusts every caller to have checked `done()` first.
     pub fn take(self: *Pending) ?*c.DBusMessage {
         const call = self.call orelse return null;
+        if (c.dbus_pending_call_get_completed(call) == 0) return null;
         self.call = null;
         const reply = c.dbus_pending_call_steal_reply(call);
         c.dbus_pending_call_unref(call);
         return reply;
     }
 
-    /// Releases the pending call without caring about its reply: cancels it
-    /// (so a notify callback, if one were ever registered, would not fire),
-    /// steals and discards whatever reply is sitting there so it isn't
-    /// leaked, then unrefs. Idempotent - safe after `take()` or a previous
-    /// `deinit()`. For the frame loop's cancel path (e.g. the user backs out
-    /// of a connect/pair modal before it completes).
+    /// Releases the pending call without caring about its reply. Idempotent -
+    /// safe after `take()` or a previous `deinit()`. For the frame loop's
+    /// cancel path (e.g. the user backs out of a connect/pair modal before
+    /// it completes).
+    ///
+    /// Steal only when the call already completed; cancel only when it did
+    /// not - never both. This class of bug is invisible to code review: the
+    /// previous version cancelled unconditionally-if-incomplete and then
+    /// unconditionally called `dbus_pending_call_steal_reply()`, which
+    /// crashed a live device with `assertion "pending->completed" failed,
+    /// Aborted` - `dbus_pending_call_cancel()` guarantees the call will
+    /// never complete, and `steal_reply()` asserts completion, so cancelling
+    /// and then stealing is a guaranteed abort on exactly the path this
+    /// function exists to serve. The reviewed-safe-looking shape came from a
+    /// libdbus precondition enforced only by an internal assertion, not by
+    /// any type or return value review could check.
     pub fn deinit(self: *Pending) void {
         const call = self.call orelse return;
         self.call = null;
-        if (c.dbus_pending_call_get_completed(call) == 0) c.dbus_pending_call_cancel(call);
-        if (c.dbus_pending_call_steal_reply(call)) |reply| c.dbus_message_unref(reply);
+        if (c.dbus_pending_call_get_completed(call) != 0) {
+            // Completed but never taken: the reply is ours to release.
+            if (c.dbus_pending_call_steal_reply(call)) |reply| c.dbus_message_unref(reply);
+        } else {
+            // Cancelling guarantees it will never complete; stealing here
+            // would abort the process. Cancel and drop our ref - libdbus
+            // frees the rest.
+            c.dbus_pending_call_cancel(call);
+        }
         c.dbus_pending_call_unref(call);
     }
 };
