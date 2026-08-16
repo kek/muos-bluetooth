@@ -146,6 +146,15 @@ pub fn endFrame(self: Ui) void {
     c.SDL_RenderPresent(self.renderer);
 }
 
+/// Fills a rectangle in `colour` - used for e.g. an error modal's backdrop,
+/// so its text doesn't composite directly over whatever else is already
+/// drawn (a selected list row's accent band included).
+pub fn fillRect(self: Ui, x: c_int, y: c_int, w: c_int, h: c_int, colour: u32) void {
+    setColor(self.renderer, colour);
+    var r = c.SDL_Rect{ .x = x, .y = y, .w = w, .h = h };
+    _ = c.SDL_RenderFillRect(self.renderer, &r);
+}
+
 const Glyphs = struct { tex: *c.SDL_Texture, w: c_int, h: c_int };
 
 /// Renders `s` to a texture. Caller owns and must destroy the returned
@@ -155,7 +164,15 @@ const Glyphs = struct { tex: *c.SDL_Texture, w: c_int, h: c_int };
 /// perfect frame in the console output (see task-7-report.md's fix-round-1
 /// notes: silence here previously made "no error output" worthless as
 /// evidence that text was actually rendered).
+///
+/// Fix round 1 (task-8-review.md finding I2): an empty string is a normal,
+/// expected input here (e.g. a device that's neither connected nor paired
+/// renders a blank right-hand status), not a failure - so it returns early
+/// rather than handing SDL_ttf a zero-width string, which fails with "Text
+/// has zero width" and would otherwise hit the diagnostic above once per
+/// blank row per frame.
 fn render(self: Ui, s: [:0]const u8, colour: u32) ?Glyphs {
+    if (s.len == 0) return null;
     const col = c.SDL_Color{
         .r = @intCast((colour >> 16) & 0xFF),
         .g = @intCast((colour >> 8) & 0xFF),

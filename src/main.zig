@@ -267,14 +267,35 @@ fn isTransient(name: [*c]const u8, detail: [*c]const u8) bool {
     return std.mem.indexOf(u8, d, "br-connection-busy") != null;
 }
 
+/// Records where a modal should return to, but only the first time one is
+/// entered from a normal state (`.list`/`.scanning`). Fix round 1, finding
+/// I1: `resume_mode` was previously only set on the connect path, so every
+/// other failure (disconnect, forget, scan toggle, a refresh mid-scan, the
+/// connect retry itself) dropped the user to `.list` even while a scan was
+/// still running on the adapter with no way back to `.scanning` from the
+/// UI's point of view. Guarding against `.err`/`.working` means a failure
+/// that happens *while already in a modal* (e.g. the retry-connect failing
+/// while `.working`) can't clobber the resume target the outer modal set.
+fn captureResumeMode(app: *App) void {
+    if (app.mode != .err and app.mode != .working) app.resume_mode = app.mode;
+}
+
+/// Single entry point for "something failed, show it": captures the resume
+/// target before switching, so every failure site returns to wherever the
+/// user actually was.
+fn fail(app: *App, text: [*c]const u8) void {
+    captureResumeMode(app);
+    setStatus(app, text);
+    app.mode = .err;
+}
+
 /// Re-lists devices, freeing the previous slice first - the hot allocation
 /// path (Task 8 brief: this runs every ~500ms while scanning) - and clamps
 /// `selected` so it never points past the end of a shrunk list (e.g. after
 /// `forget`).
 fn refreshDevices(app: *App) void {
     const new_list = bluez.list(app.gpa, app.conn) catch |e| {
-        setStatus(app, @errorName(e).ptr);
-        app.mode = .err;
+        fail(app, @errorName(e).ptr);
         return;
     };
     bluez.freeList(app.gpa, app.devices);
@@ -304,15 +325,31 @@ fn devicesAction(app: *App, btn: ui.Button) void {
                 var err = dbus.Error{};
                 defer err.deinit();
                 bluez.disconnect(app.conn, dev, &err) catch {
-                    setStatus(app, err.text());
-                    app.mode = .err;
+                    fail(app, err.text());
                     return;
                 };
                 refreshDevices(app);
             } else {
+                // Fix round 1, finding I6: stop any in-progress scan before
+                // connecting. BlueZ commonly reports
+                // org.bluez.Error.InProgress/"br-connection-busy" when a
+                // connect races discovery on the same adapter - exactly the
+                // state this UI leaves the user in after `y`. Without this,
+                // the one-shot retry below waits a second and then hits the
+                // same failure again, since discovery would still be
+                // running. This matches bluetoothctl and other BlueZ
+                // clients: starting a connect ends an in-progress scan
+                // (user-visible: the header drops out of "Scanning..."),
+                // and it stays stopped through the retry since nothing
+                // restarts it until the user presses `y` again.
+                if (app.mode == .scanning) {
+                    var stop_err = dbus.Error{};
+                    defer stop_err.deinit();
+                    bluez.stopScan(app.conn, &stop_err) catch {};
+                    app.mode = .list;
+                }
                 const pending = bluez.connectAsync(app.conn, dev) catch |e| {
-                    setStatus(app, @errorName(e).ptr);
-                    app.mode = .err;
+                    fail(app, @errorName(e).ptr);
                     return;
                 };
                 app.pending = pending;
@@ -320,7 +357,7 @@ fn devicesAction(app: *App, btn: ui.Button) void {
                 app.pending_is_audio = dev.isAudio();
                 app.pending_retried = false;
                 app.retry_scheduled = false;
-                app.resume_mode = app.mode;
+                captureResumeMode(app);
                 app.mode = .working;
             }
         },
@@ -330,8 +367,7 @@ fn devicesAction(app: *App, btn: ui.Button) void {
             var err = dbus.Error{};
             defer err.deinit();
             bluez.forget(app.conn, dev, &err) catch {
-                setStatus(app, err.text());
-                app.mode = .err;
+                fail(app, err.text());
                 return;
             };
             refreshDevices(app);
@@ -341,15 +377,13 @@ fn devicesAction(app: *App, btn: ui.Button) void {
             defer err.deinit();
             if (app.mode == .scanning) {
                 bluez.stopScan(app.conn, &err) catch {
-                    setStatus(app, err.text());
-                    app.mode = .err;
+                    fail(app, err.text());
                     return;
                 };
                 app.mode = .list;
             } else {
                 bluez.startScan(app.conn, &err) catch {
-                    setStatus(app, err.text());
-                    app.mode = .err;
+                    fail(app, err.text());
                     return;
                 };
                 app.mode = .scanning;
@@ -419,8 +453,7 @@ fn updatePending(app: *App) void {
         app.pending = null;
 
         const r = reply orelse {
-            setStatus(app, "no reply");
-            app.mode = .err;
+            fail(app, "no reply");
             return;
         };
         defer dbus.c.dbus_message_unref(r);
@@ -432,8 +465,7 @@ fn updatePending(app: *App) void {
                 app.retry_scheduled = true;
                 app.retry_at_ms = ticks + connect_retry_delay_ms;
             } else {
-                setStatus(app, detail);
-                app.mode = .err;
+                fail(app, detail);
             }
             return;
         }
@@ -450,8 +482,7 @@ fn updatePending(app: *App) void {
         app.retry_scheduled = false;
         const dev = app.devices[app.pending_index];
         app.pending = bluez.connectAsync(app.conn, dev) catch |e| {
-            setStatus(app, @errorName(e).ptr);
-            app.mode = .err;
+            fail(app, @errorName(e).ptr);
             return;
         };
     }
@@ -500,10 +531,23 @@ fn renderAudioStub(app: *App) void {
 /// already user-legible, so it's shown verbatim - see the task-4 defect this
 /// guards against: surfacing just `@errorName` and discarding the real
 /// reason.
+///
+/// Fix round 1 (task-8-review.md finding I3): the modal previously drew
+/// straight over the list with no backdrop - glyphs over glyphs, including
+/// a selected row's filled accent band. A bordered panel in `pal.bg` behind
+/// the text is the actual fix; `pal.accent` border makes it read as a
+/// distinct panel rather than a color-matched cutout of the background.
 fn renderErrorModal(app: *App) void {
-    ui.text(app.ui, 8, 200, "ERROR", app.pal.accent);
-    ui.text(app.ui, 8, 228, &app.status, app.pal.fg);
-    ui.text(app.ui, 8, 256, "press any button to continue", app.pal.dim);
+    const x: c_int = 16;
+    const y: c_int = 190;
+    const w: c_int = ui.screen_w - 32;
+    const h: c_int = 100;
+    ui.fillRect(app.ui, x - 2, y - 2, w + 4, h + 4, app.pal.accent);
+    ui.fillRect(app.ui, x, y, w, h, app.pal.bg);
+
+    ui.text(app.ui, x + 8, y + 10, "ERROR", app.pal.accent);
+    ui.text(app.ui, x + 8, y + 38, &app.status, app.pal.fg);
+    ui.text(app.ui, x + 8, y + 66, "press any button to continue", app.pal.dim);
 }
 
 fn render(app: *App) void {
@@ -532,20 +576,42 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
         _ = c.printf("agent registration failed: %s\n", @errorName(e).ptr);
     };
 
+    // Fix round 1, RULING I5: bring the adapter up best-effort. A fresh boot
+    // commonly has Bluetooth powered off, in which case `list` comes back
+    // empty and every action fails with an error the user has no way to
+    // resolve from inside the app - the spec's self-sufficiency clause means
+    // the app should recover from that itself rather than defer it to
+    // packaging (Task 10). Best-effort per the ruling: a failure here is
+    // logged but does not stop the UI from starting.
+    var poweron_err = dbus.Error{};
+    defer poweron_err.deinit();
+    bluez.powerOn(conn, &poweron_err) catch {
+        _ = c.printf("power on failed: %s\n", poweron_err.text());
+    };
+
     var app = App{
         .gpa = gpa,
         .conn = conn,
         .ui = sdl_ui,
         .pal = theme.palette(),
     };
-    // Runs last-declared-first-executed (LIFO): pending is cancelled before
-    // the device list it may still reference by index is freed.
+    // Runs last-declared-first-executed (LIFO): pending is cancelled, then
+    // discovery is stopped if still running, then the device list it may
+    // still reference by index is freed.
     defer if (app.pending) |*p| p.deinit();
+    // Fix round 1, finding I4: without this, quitting mid-scan leaves BlueZ
+    // discovering indefinitely after btui exits - battery drain, and a state
+    // muOS's frontend may not expect. Best-effort: nothing useful to do with
+    // a failure here on the way out.
+    defer if (app.mode == .scanning) {
+        var stop_err = dbus.Error{};
+        defer stop_err.deinit();
+        bluez.stopScan(conn, &stop_err) catch {};
+    };
     defer bluez.freeList(gpa, app.devices);
 
     app.devices = bluez.list(gpa, conn) catch |e| blk: {
-        setStatus(&app, @errorName(e).ptr);
-        app.mode = .err;
+        fail(&app, @errorName(e).ptr);
         break :blk &.{};
     };
 
