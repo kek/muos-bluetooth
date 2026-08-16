@@ -53,12 +53,19 @@ pub fn connectSystem(err: *Error) DBusFailure!Connection {
     return .{ .handle = conn orelse return DBusFailure.ConnectFailed };
 }
 
+/// `dbus_message_iter_get_basic` does not copy string data: the returned
+/// pointer aliases a buffer owned by the `DBusMessage` the iterator was
+/// initialised from. It is only valid while that message is alive and
+/// unreffed; callers who need the value to outlive the message must copy it.
 pub fn iterString(it: *c.DBusMessageIter) [*c]const u8 {
     var s: [*c]const u8 = undefined;
     c.dbus_message_iter_get_basic(it, @ptrCast(&s));
     return s;
 }
 
+/// Same lifetime note as `iterString`: valid only while the source
+/// `DBusMessage` is alive and unreffed (bools are copied by value here, but
+/// the iterator itself still points into that message).
 pub fn iterBool(it: *c.DBusMessageIter) bool {
     var b: c.dbus_bool_t = 0;
     c.dbus_message_iter_get_basic(it, @ptrCast(&b));
