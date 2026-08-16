@@ -211,7 +211,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     if (hasFlag(init.args, "--input-test")) {
-        ui.inputTest(20_000) catch |e| {
+        const font_path = testFontPath(gpa) orelse return;
+        defer gpa.free(font_path);
+        ui.inputTest(font_path, 20_000) catch |e| {
             _ = c.printf("input test failed: %s\n", @errorName(e).ptr);
         };
         return;

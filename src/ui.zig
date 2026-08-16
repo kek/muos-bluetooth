@@ -283,32 +283,80 @@ pub fn poll(self: Ui) ?Button {
     return null;
 }
 
-/// Prints every controller/joystick event so the mapping in `poll` can be
-/// confirmed (or corrected) against real hardware. Exits on SDL_QUIT or
-/// after `timeout_ms`, whichever comes first. Kept even though the muOS-Keys
-/// mapping is now known (gamecontrollerdb.txt, see poll()'s doc comment) -
-/// Task 8's UI testing is expected to re-run this once with the device in
-/// hand to confirm it live.
-pub fn inputTest(timeout_ms: u32) !void {
-    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK | c.SDL_INIT_GAMECONTROLLER) != 0) {
-        std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
-        return error.SdlInit;
-    }
-    defer c.SDL_Quit();
-
-    const win = c.SDL_CreateWindow("btui", 0, 0, screen_w, screen_h, c.SDL_WINDOW_SHOWN) orelse {
-        std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
-        return error.SdlWindow;
+/// Name shown on screen and matched against `poll`'s own mapping - kept in
+/// sync by hand since `poll` returns a `Button`, not the raw SDL constant.
+fn controllerButtonName(button: u8) []const u8 {
+    return switch (button) {
+        c.SDL_CONTROLLER_BUTTON_A => "A",
+        c.SDL_CONTROLLER_BUTTON_B => "B",
+        c.SDL_CONTROLLER_BUTTON_X => "X",
+        c.SDL_CONTROLLER_BUTTON_Y => "Y",
+        c.SDL_CONTROLLER_BUTTON_LEFTSHOULDER => "L1",
+        c.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER => "R1",
+        c.SDL_CONTROLLER_BUTTON_DPAD_UP => "UP",
+        c.SDL_CONTROLLER_BUTTON_DPAD_DOWN => "DOWN",
+        c.SDL_CONTROLLER_BUTTON_DPAD_LEFT => "LEFT",
+        c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT => "RIGHT",
+        else => "(unmapped)",
     };
-    defer c.SDL_DestroyWindow(win);
+}
 
-    const pad = openPad();
-    defer if (pad.controller) |ctl| c.SDL_GameControllerClose(ctl);
-    defer if (pad.joystick) |j| c.SDL_JoystickClose(j);
+/// Renders `s` centred horizontally at `y` in `font` - used for the one big
+/// "last event" line, which needs a font size `Ui.font` (18pt, sized for
+/// list rows) is too small for. Not part of `render()`/`text()` because it
+/// takes an explicit font rather than `self.font`.
+fn drawCentered(ren: *c.SDL_Renderer, font: *c.TTF_Font, y: c_int, s: [:0]const u8, colour: u32) void {
+    const col = c.SDL_Color{
+        .r = @intCast((colour >> 16) & 0xFF),
+        .g = @intCast((colour >> 8) & 0xFF),
+        .b = @intCast(colour & 0xFF),
+        .a = 0xFF,
+    };
+    const surf = c.TTF_RenderUTF8_Blended(font, s.ptr, col) orelse {
+        std.debug.print("TTF_RenderUTF8_Blended failed: {s}\n", .{c.TTF_GetError()});
+        return;
+    };
+    defer c.SDL_FreeSurface(surf);
+    const tex = c.SDL_CreateTextureFromSurface(ren, surf) orelse {
+        std.debug.print("SDL_CreateTextureFromSurface failed: {s}\n", .{c.SDL_GetError()});
+        return;
+    };
+    defer c.SDL_DestroyTexture(tex);
+    var dst = c.SDL_Rect{ .x = @divTrunc(screen_w - surf.*.w, 2), .y = y, .w = surf.*.w, .h = surf.*.h };
+    _ = c.SDL_RenderCopy(ren, tex, null, &dst);
+}
+
+/// Renders every frame so a human pressing buttons gets immediate on-screen
+/// feedback: title, the last event (large, roughly centred), a running
+/// event count, and seconds remaining. Exits on SDL_QUIT, `.b`, or after
+/// `timeout_ms`, whichever comes first. Every event is still printed to
+/// stdout exactly as before, for the log a reviewer reads afterwards.
+///
+/// Fix-round-1 addendum: the first version of this test created a window
+/// but never drew a single frame, so the screen kept showing whatever was
+/// already on it - a device owner asked to press buttons had no way to tell
+/// the test was even running, and pressed nothing. On-screen feedback is
+/// what makes a live pass actually testable.
+pub fn inputTest(font_path: [:0]const u8, timeout_ms: u32) !void {
+    const ui = try init(font_path);
+    defer deinit(ui);
+
+    // A second, larger font just for the "last event" line - the 18pt list
+    // font is legible at a glance but not the "unmistakable from across the
+    // room" size this test wants. Falls back to the list font if a bigger
+    // size can't be opened, rather than failing the whole test over it.
+    const big_font = c.TTF_OpenFont(font_path.ptr, 40);
+    defer if (big_font) |f| c.TTF_CloseFont(f);
+
     std.debug.print("controller: {s}  joystick fallback: {s}\n", .{
-        if (pad.controller != null) "opened" else "none",
-        if (pad.joystick != null) "opened" else "none",
+        if (ui.controller != null) "opened" else "none",
+        if (ui.joystick != null) "opened" else "none",
     });
+
+    const pal = theme.palette();
+    var event_count: u32 = 0;
+    var last_buf: [64:0]u8 = undefined;
+    var last_event: [:0]const u8 = std.fmt.bufPrintZ(&last_buf, "(no events yet)", .{}) catch "?";
 
     var elapsed: u32 = 0;
     while (elapsed < timeout_ms) : (elapsed += 16) {
@@ -316,12 +364,40 @@ pub fn inputTest(timeout_ms: u32) !void {
         while (c.SDL_PollEvent(&ev) != 0) {
             switch (ev.type) {
                 c.SDL_QUIT => return,
-                c.SDL_CONTROLLERBUTTONDOWN => std.debug.print("controller button {d}\n", .{ev.cbutton.button}),
-                c.SDL_JOYBUTTONDOWN => std.debug.print("raw joystick button {d}\n", .{ev.jbutton.button}),
-                c.SDL_JOYHATMOTION => std.debug.print("raw hat {d}\n", .{ev.jhat.value}),
+                c.SDL_CONTROLLERBUTTONDOWN => {
+                    event_count += 1;
+                    const name = controllerButtonName(ev.cbutton.button);
+                    std.debug.print("controller button {d} ({s})\n", .{ ev.cbutton.button, name });
+                    last_event = std.fmt.bufPrintZ(&last_buf, "{s}", .{name}) catch last_event;
+                },
+                c.SDL_JOYBUTTONDOWN => {
+                    event_count += 1;
+                    std.debug.print("raw joystick button {d}\n", .{ev.jbutton.button});
+                    last_event = std.fmt.bufPrintZ(&last_buf, "raw joystick button {d}", .{ev.jbutton.button}) catch last_event;
+                },
+                c.SDL_JOYHATMOTION => {
+                    event_count += 1;
+                    std.debug.print("raw hat {d}\n", .{ev.jhat.value});
+                    last_event = std.fmt.bufPrintZ(&last_buf, "raw hat {d}", .{ev.jhat.value}) catch last_event;
+                },
                 else => {},
             }
         }
+
+        beginFrame(ui, pal);
+        text(ui, 24, 24, "INPUT TEST - press A B X Y L1 R1 UP DOWN", pal.fg);
+        drawCentered(ui.renderer, big_font orelse ui.font, 180, last_event, pal.accent);
+
+        var count_buf: [32:0]u8 = undefined;
+        const count_str = std.fmt.bufPrintZ(&count_buf, "events seen: {d}", .{event_count}) catch "events seen: ?";
+        text(ui, 24, 280, count_str, pal.fg);
+
+        var secs_buf: [32:0]u8 = undefined;
+        const secs_left = (timeout_ms - elapsed) / 1000;
+        const secs_str = std.fmt.bufPrintZ(&secs_buf, "{d}s remaining", .{secs_left}) catch "?s remaining";
+        text(ui, 24, 320, secs_str, pal.dim);
+        endFrame(ui);
+
         c.SDL_Delay(16);
     }
 }
