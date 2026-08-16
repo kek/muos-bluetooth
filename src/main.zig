@@ -10,6 +10,7 @@ const c = @cImport({
 const dbus = @import("dbus.zig");
 const bluez = @import("bluez.zig");
 const audio = @import("audio.zig");
+const theme = @import("theme.zig");
 
 pub const version = "0.1.0";
 
@@ -63,6 +64,22 @@ fn printSinks(gpa: std.mem.Allocator) void {
     }
 }
 
+fn printTheme(gpa: std.mem.Allocator) void {
+    const name = theme.activeName(gpa) catch |e| {
+        _ = c.printf("theme lookup failed: %s\n", @errorName(e).ptr);
+        return;
+    };
+    defer gpa.free(name);
+
+    const font = theme.fontPath(gpa, name) catch |e| {
+        _ = c.printf("theme: %.*s  font lookup failed: %s\n", @as(c_int, @intCast(name.len)), name.ptr, @errorName(e).ptr);
+        return;
+    };
+    defer gpa.free(font);
+
+    _ = c.printf("theme: %.*s  font: %s\n", @as(c_int, @intCast(name.len)), name.ptr, font.ptr);
+}
+
 /// `--dump` is the project's main development feedback loop: it prints the
 /// device list over SSH with no UI involved.
 fn dumpMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
@@ -70,6 +87,7 @@ fn dumpMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
     defer bluez.freeList(gpa, devices);
     printDevices(devices);
     printSinks(gpa);
+    printTheme(gpa);
 }
 
 /// Starts discovery, gives the adapter a few seconds to hear back from

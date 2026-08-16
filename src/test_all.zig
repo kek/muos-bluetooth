@@ -8,4 +8,5 @@ test "test harness runs" {
 
 test {
     _ = @import("audio.zig");
+    _ = @import("theme.zig");
 }
