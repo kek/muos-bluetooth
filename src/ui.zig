@@ -157,6 +157,18 @@ pub fn fillRect(self: Ui, x: c_int, y: c_int, w: c_int, h: c_int, colour: u32) v
 
 const Glyphs = struct { tex: *c.SDL_Texture, w: c_int, h: c_int };
 
+/// An empty string is normal, expected input (e.g. a device that's neither
+/// connected nor paired renders a blank right-hand status) - not a failure.
+/// `TTF_RenderUTF8_Blended` fails outright on one ("Text has zero width"),
+/// so both entry points into it (`render`, `drawCentered`) check this first
+/// rather than let a routine blank string hit their failure-diagnostic path
+/// (fix round 1 finding I2 first fixed this in `render`; fix round 2 finding
+/// G2 found the sibling gap in `drawCentered` and asked for a shared check
+/// rather than a second copy of the same one-liner).
+fn hasText(s: [:0]const u8) bool {
+    return s.len != 0;
+}
+
 /// Renders `s` to a texture. Caller owns and must destroy the returned
 /// texture; the intermediate surface is freed here regardless of outcome.
 /// Both failure paths print the SDL/TTF error text rather than failing
@@ -164,15 +176,8 @@ const Glyphs = struct { tex: *c.SDL_Texture, w: c_int, h: c_int };
 /// perfect frame in the console output (see task-7-report.md's fix-round-1
 /// notes: silence here previously made "no error output" worthless as
 /// evidence that text was actually rendered).
-///
-/// Fix round 1 (task-8-review.md finding I2): an empty string is a normal,
-/// expected input here (e.g. a device that's neither connected nor paired
-/// renders a blank right-hand status), not a failure - so it returns early
-/// rather than handing SDL_ttf a zero-width string, which fails with "Text
-/// has zero width" and would otherwise hit the diagnostic above once per
-/// blank row per frame.
 fn render(self: Ui, s: [:0]const u8, colour: u32) ?Glyphs {
-    if (s.len == 0) return null;
+    if (!hasText(s)) return null;
     const col = c.SDL_Color{
         .r = @intCast((colour >> 16) & 0xFF),
         .g = @intCast((colour >> 8) & 0xFF),
@@ -323,6 +328,7 @@ fn controllerButtonName(button: u8) []const u8 {
 /// list rows) is too small for. Not part of `render()`/`text()` because it
 /// takes an explicit font rather than `self.font`.
 fn drawCentered(ren: *c.SDL_Renderer, font: *c.TTF_Font, y: c_int, s: [:0]const u8, colour: u32) void {
+    if (!hasText(s)) return;
     const col = c.SDL_Color{
         .r = @intCast((colour >> 16) & 0xFF),
         .g = @intCast((colour >> 8) & 0xFF),

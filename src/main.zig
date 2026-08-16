@@ -289,6 +289,19 @@ fn fail(app: *App, text: [*c]const u8) void {
     app.mode = .err;
 }
 
+/// True when discovery is - or, from the user's point of view, still ought
+/// to be - running: either `mode` is directly `.scanning`, or an error modal
+/// is up whose `resume_mode` is `.scanning` (dismissing it would return to
+/// `.scanning`, so the adapter was never actually told to stop). Fix round 2,
+/// finding G2: the exit-time `stopScan` guard previously checked only
+/// `mode == .scanning`, missing exactly this case - e.g. a scan-tick
+/// `refreshDevices` failure, which routes through `fail` and leaves
+/// `mode = .err` / `resume_mode = .scanning` - if the process exits via
+/// `SDL_QUIT` before the modal is dismissed.
+fn isScanning(app: *App) bool {
+    return app.mode == .scanning or (app.mode == .err and app.resume_mode == .scanning);
+}
+
 /// Re-lists devices, freeing the previous slice first - the hot allocation
 /// path (Task 8 brief: this runs every ~500ms while scanning) - and clamps
 /// `selected` so it never points past the end of a shrunk list (e.g. after
@@ -599,11 +612,13 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
     // discovery is stopped if still running, then the device list it may
     // still reference by index is freed.
     defer if (app.pending) |*p| p.deinit();
-    // Fix round 1, finding I4: without this, quitting mid-scan leaves BlueZ
-    // discovering indefinitely after btui exits - battery drain, and a state
-    // muOS's frontend may not expect. Best-effort: nothing useful to do with
-    // a failure here on the way out.
-    defer if (app.mode == .scanning) {
+    // Fix round 1, finding I4 (widened by fix round 2, finding G2 - see
+    // `isScanning`): without this, quitting while discovery is still
+    // running (or ought to still be, from the error-modal case) leaves
+    // BlueZ discovering indefinitely after btui exits - battery drain, and
+    // a state muOS's frontend may not expect. Best-effort: nothing useful
+    // to do with a failure here on the way out.
+    defer if (isScanning(&app)) {
         var stop_err = dbus.Error{};
         defer stop_err.deinit();
         bluez.stopScan(conn, &stop_err) catch {};
