@@ -181,9 +181,10 @@ pw-metadata -n settings 0 clock.force-quantum 0     # back to muOS's default
 ```
 
 Measured on an RG40XX V with a Bose NC 700: SNES emulation broke up
-intermittently at 2048 and was clean at 512, with `pw-top` reporting `ERR 0`
-(no xruns) in *both* cases — i.e. the dropouts were on the radio link, not in
-the audio pipeline. Latency improved only marginally; stability was the win.
+intermittently at 2048, was clean at 512, and broke up again on switching back
+to 2048 — a reversal test, not a single observation. `pw-top` reported `ERR 0`
+(no xruns) in *every* case, so the dropouts were on the radio link, not in the
+audio pipeline. Latency improved only marginally; stability was the win.
 Set `BT_QUANTUM=0` to opt out, or raise it if emulators start crackling.
 
 **Check the hook actually ran.** `tail /mnt/mmc/MUOS/log/bluetooth.log`. It is
