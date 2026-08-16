@@ -56,7 +56,8 @@ menu entry whose screens are not in the binary. On 2601.1 the frontend has
 ```
 
 That copies `init/10-bluetooth.sh` to `/mnt/mmc/MUOS/init/`, the helpers to
-`/mnt/mmc/MUOS/bluetooth/`, and sets `user_init` to `1`. Reboot afterwards.
+`/mnt/mmc/MUOS/bluetooth/`, the `btui` app to `/mnt/mmc/MUOS/application/Bluetooth/`,
+and sets `user_init` to `1`. Reboot afterwards.
 
 Doing it by hand is the same three steps:
 
@@ -90,6 +91,79 @@ would have written the built binary to that stranger with no complaint, and
 libraries instead of the handheld's. If a device-facing `make` target aborts
 with "does not look like muOS," `$(DEVICE)` is pointing at the wrong box —
 fix that before retrying, don't bypass the check.
+
+## The `btui` app
+
+Once installed, `btui` also shows up in muOS's **Applications** menu (icon:
+Bluetooth) as a handheld alternative to the SSH workflow above. It talks to
+the same BlueZ/PipeWire stack the hook brings up, so the app and the shell
+helpers can be used interchangeably — the app doesn't replace the hook, it
+just gives you a menu-driven front end for the parts of the shell helpers
+that are otherwise SSH-only (scanning, pairing, connect/disconnect/forget,
+and choosing the audio sink).
+
+There are two tabs, switched with `L1`/`R1`:
+
+| Tab | Purpose |
+|---|---|
+| Devices | Scan, pair, connect, disconnect, forget |
+| Audio | See and pick the active PipeWire sink |
+
+Controls:
+
+| Button | Action |
+|---|---|
+| D-pad up/down | Move selection |
+| `A` | Devices: connect (or pair, then connect, if not yet paired). Audio: set the selected sink as default |
+| `B` | Quit `btui`, back to muOS |
+| `X` | Forget the selected device (Devices tab only) |
+| `Y` | Start/stop a scan (Devices tab only) |
+| `L1` / `R1` | Switch tab |
+
+**Security note, read this before leaving it running unattended.** While
+`btui` is open it registers a `NoInputNoOutput` BlueZ pairing agent, and that
+agent auto-accepts `RequestConfirmation` and `AuthorizeService` for *any*
+initiator — not just a device you're actively trying to pair. In practice
+this means that for as long as the app is on screen, anything within radio
+range can pair with the handheld with no prompt and no confirmation, and
+have every service it asks for authorized. This is intentional: it is what
+lets pairing work at all from the handheld's own screen without an `expect`
+script driving `bluetoothctl` (the approach bltMuos takes — see
+[Why not bltMuos?](#why-not-bltmuos)). The tradeoff is that `btui` should be
+treated like any other "discoverable and pairable" state — open it to pair
+what you mean to pair, then back out with `B` rather than leaving it running
+in the background.
+
+**Typeface.** No muOS theme ships a TrueType font — the theme's own font
+files are LVGL's binary `.bin` format, which `SDL_ttf` cannot load. `btui`
+looks for a `.ttf` under the active theme's font directory anyway, but on
+every theme currently shipping it falls through to a bundled system font
+(Inconsolata, the same one PPSSPP carries) instead. Its colour palette is
+also its own — a fixed dark background with the MustardOS yellow accent —
+not read from the active theme's colour scheme. So don't expect `btui` to
+match a given theme's look beyond coincidence; it has a look of its own.
+
+**Testing over SSH: the frontend-suspend gotcha.** If you drive `btui` over
+SSH while it's meant to be the foreground app, the usual `killall -STOP
+muxfrontend` trick to freeze muOS's frontend often silently does nothing.
+muOS renames the frontend process per screen (`{muxlaunch}` on the main
+menu, `{muxapp}` on the app list, etc.) even though the binary on disk is
+still `/opt/muos/frontend/muxfrontend` — `killall` matches by the process's
+current name, not its path, so it misses. When that happens the frontend
+keeps both the display and the input, so your keypresses land on muOS's menu
+instead of the app you're testing, and nothing about `btui` looks broken
+because it never got the input in the first place. The reliable form
+matches by path instead of name:
+
+```sh
+FPID=$(pgrep -f "/opt/muos/frontend/muxfrontend" | head -1)
+kill -STOP "$FPID"
+# ... drive/observe btui ...
+kill -CONT "$FPID"
+```
+
+This cost two wasted test sessions before the cause was found — worth
+knowing before you conclude the app itself is unresponsive.
 
 ## Pairing
 
