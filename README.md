@@ -78,6 +78,19 @@ The hook is idempotent and safe to run by hand:
 ssh root@<device-ip> 'sh /mnt/mmc/MUOS/init/10-bluetooth.sh; tail -20 /mnt/mmc/MUOS/log/bluetooth.log'
 ```
 
+### `btui` development builds
+
+The Zig Bluetooth UI (`src/`, `Makefile`) also reaches the device over SSH —
+`make sysroot` / `make deploy` / `make run`. Every one of those checks
+`/etc/os-release` for `MustardOS` before touching anything (`check-device` in
+the `Makefile`), because a Nerves/Elixir device answered the handheld's IP
+for an unknown window during development. Before this check existed, `deploy`
+would have written the built binary to that stranger with no complaint, and
+`sysroot` would have filled the build's link-time ABI reference with its
+libraries instead of the handheld's. If a device-facing `make` target aborts
+with "does not look like muOS," `$(DEVICE)` is pointing at the wrong box —
+fix that before retrying, don't bypass the check.
+
 ## Pairing
 
 ```sh
