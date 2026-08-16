@@ -137,8 +137,9 @@ in the background.
 **Typeface.** No muOS theme ships a TrueType font — the theme's own font
 files are LVGL's binary `.bin` format, which `SDL_ttf` cannot load. `btui`
 looks for a `.ttf` under the active theme's font directory anyway, but on
-every theme currently shipping it falls through to a bundled system font
-(Inconsolata, the same one PPSSPP carries) instead. Its colour palette is
+every theme currently shipping it falls through to a system font that's
+already on the device — Inconsolata, the copy muOS's own PPSSPP install
+carries — rather than anything this repo installs. Its colour palette is
 also its own — a fixed dark background with the MustardOS yellow accent —
 not read from the active theme's colour scheme. So don't expect `btui` to
 match a given theme's look beyond coincidence; it has a look of its own.
