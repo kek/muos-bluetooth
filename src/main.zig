@@ -200,6 +200,13 @@ fn testFontPath(gpa: std.mem.Allocator) ?[:0]u8 {
 const Mode = enum { list, scanning, working, err };
 const Tab = enum { devices, audio };
 
+/// Which async D-Bus call `App.pending` is currently carrying. `a` on an
+/// unpaired device pairs first, then chains straight into a connect on
+/// success (see `beginAsync`/`updatePending`) - a third async step the
+/// original devices-tab design didn't have, since the plan's Task 8 action
+/// list omitted pairing entirely.
+const PendingKind = enum { pair, connect };
+
 const scan_refresh_ms: u32 = 500;
 const connect_retry_delay_ms: u32 = 1000;
 
@@ -225,6 +232,7 @@ const App = struct {
     last_refresh_ms: u32 = 0,
 
     pending: ?dbus.Pending = null,
+    pending_kind: PendingKind = .connect,
     pending_index: usize = 0,
     pending_is_audio: bool = false,
     pending_retried: bool = false,
@@ -320,9 +328,42 @@ fn refreshDevices(app: *App) void {
     }
 }
 
-/// Devices-tab actions: move selection, connect/disconnect, forget, toggle
-/// scanning, switch to the audio tab, or exit. Connect is the only
-/// non-blocking one - see `App.pending` and `updatePending`.
+/// Starts an async pair or connect on the currently-selected device: stops
+/// any in-progress scan first (fix round 1, finding I6 - the same
+/// InProgress/"br-connection-busy" race applies to `Pair` as much as
+/// `Connect`, since both are BlueZ device operations that can collide with
+/// discovery on the same adapter), captures `resume_mode`, and enters
+/// `.working`. An immediate (synchronous) failure to even issue the call
+/// routes through `fail` like every other failure site.
+fn beginAsync(app: *App, kind: PendingKind) void {
+    const dev = app.devices[app.selected];
+    if (app.mode == .scanning) {
+        var stop_err = dbus.Error{};
+        defer stop_err.deinit();
+        bluez.stopScan(app.conn, &stop_err) catch {};
+        app.mode = .list;
+    }
+    const pending = (switch (kind) {
+        .pair => bluez.pairAsync(app.conn, dev),
+        .connect => bluez.connectAsync(app.conn, dev),
+    }) catch |e| {
+        fail(app, @errorName(e).ptr);
+        return;
+    };
+    app.pending = pending;
+    app.pending_kind = kind;
+    app.pending_index = app.selected;
+    app.pending_is_audio = dev.isAudio();
+    app.pending_retried = false;
+    app.retry_scheduled = false;
+    captureResumeMode(app);
+    app.mode = .working;
+}
+
+/// Devices-tab actions: move selection, pair/connect/disconnect, forget,
+/// toggle scanning, switch to the audio tab, or exit. Pair and connect are
+/// the only non-blocking ones - see `App.pending`/`PendingKind` and
+/// `updatePending`.
 fn devicesAction(app: *App, btn: ui.Button) void {
     switch (btn) {
         .up => {
@@ -342,36 +383,15 @@ fn devicesAction(app: *App, btn: ui.Button) void {
                     return;
                 };
                 refreshDevices(app);
+            } else if (dev.paired) {
+                beginAsync(app, .connect);
             } else {
-                // Fix round 1, finding I6: stop any in-progress scan before
-                // connecting. BlueZ commonly reports
-                // org.bluez.Error.InProgress/"br-connection-busy" when a
-                // connect races discovery on the same adapter - exactly the
-                // state this UI leaves the user in after `y`. Without this,
-                // the one-shot retry below waits a second and then hits the
-                // same failure again, since discovery would still be
-                // running. This matches bluetoothctl and other BlueZ
-                // clients: starting a connect ends an in-progress scan
-                // (user-visible: the header drops out of "Scanning..."),
-                // and it stays stopped through the retry since nothing
-                // restarts it until the user presses `y` again.
-                if (app.mode == .scanning) {
-                    var stop_err = dbus.Error{};
-                    defer stop_err.deinit();
-                    bluez.stopScan(app.conn, &stop_err) catch {};
-                    app.mode = .list;
-                }
-                const pending = bluez.connectAsync(app.conn, dev) catch |e| {
-                    fail(app, @errorName(e).ptr);
-                    return;
-                };
-                app.pending = pending;
-                app.pending_index = app.selected;
-                app.pending_is_audio = dev.isAudio();
-                app.pending_retried = false;
-                app.retry_scheduled = false;
-                captureResumeMode(app);
-                app.mode = .working;
+                // Team-lead ruling: pairing has no key of its own - `a` on
+                // an unpaired device pairs first, then chains into connect
+                // on success (see `updatePending`). The plan's Task 8 action
+                // list omitted pairing entirely; this is what actually
+                // exercises the Task 4 pairing agent from the UI.
+                beginAsync(app, .pair);
             }
         },
         .x => {
@@ -433,10 +453,10 @@ fn handleInput(app: *App, btn: ui.Button) void {
     }
 
     if (app.mode == .working) {
-        // Only cancel-and-back-out is live while a connect is in flight;
-        // every other input is ignored rather than risking an action (like
-        // starting a scan, which reallocates `app.devices`) against a
-        // `Pending` that still references the old device by index.
+        // Only cancel-and-back-out is live while a pair or connect is in
+        // flight; every other input is ignored rather than risking an
+        // action (like starting a scan, which reallocates `app.devices`)
+        // against a `Pending` that still references the old device by index.
         if (btn == .b) {
             if (app.pending) |*p| p.deinit();
             app.pending = null;
@@ -452,10 +472,13 @@ fn handleInput(app: *App, btn: ui.Button) void {
     }
 }
 
-/// Polls the in-flight `Connect`, and drives the one-shot retry for a
+/// Polls the in-flight `Pair`/`Connect`, and drives the one-shot retry for a
 /// transient `InProgress`/"br-connection-busy" failure. Never blocks: it
 /// only acts when `pending.done()` is already true, or when the retry delay
-/// has elapsed.
+/// has elapsed. A successful `Pair` chains straight into a `Connect`
+/// (`pending_kind` flips from `.pair` to `.connect`, `mode` stays
+/// `.working`) rather than returning to the caller - see the team-lead
+/// ruling in `devicesAction`'s `.a` handler.
 fn updatePending(app: *App) void {
     if (app.mode != .working) return;
     const ticks = c.SDL_GetTicks();
@@ -483,18 +506,48 @@ fn updatePending(app: *App) void {
             return;
         }
 
-        // Success. TODO(Task 9): when app.pending_is_audio, poll
-        // audio.sinks for up to 5s for a bluetooth sink and audio.setDefault
-        // it here - the auto-routing behaviour from the task-9 brief.
-        refreshDevices(app);
-        if (app.mode == .working) app.mode = app.resume_mode;
+        // Success.
+        switch (app.pending_kind) {
+            .pair => {
+                // Team-lead ruling: pairing chains straight into connect.
+                // Trust it first so it reconnects on its own later without
+                // this app running - best-effort, since trust is a
+                // convenience, not a precondition for the connect that
+                // follows, so its failure doesn't stop the chain.
+                const dev = app.devices[app.pending_index];
+                var trust_err = dbus.Error{};
+                defer trust_err.deinit();
+                bluez.setTrusted(app.conn, dev, true, &trust_err) catch {
+                    _ = c.printf("setTrusted failed (continuing to connect anyway): %s\n", trust_err.text());
+                };
+                const pending2 = bluez.connectAsync(app.conn, dev) catch |e| {
+                    fail(app, @errorName(e).ptr);
+                    return;
+                };
+                app.pending = pending2;
+                app.pending_kind = .connect;
+                app.pending_retried = false;
+                // Stays `.working` - a pair-then-connect chain, not done yet.
+            },
+            .connect => {
+                // TODO(Task 9): when app.pending_is_audio, poll
+                // audio.sinks for up to 5s for a bluetooth sink and
+                // audio.setDefault it here - the auto-routing behaviour
+                // from the task-9 brief.
+                refreshDevices(app);
+                if (app.mode == .working) app.mode = app.resume_mode;
+            },
+        }
         return;
     }
 
     if (app.retry_scheduled and ticks >= app.retry_at_ms) {
         app.retry_scheduled = false;
         const dev = app.devices[app.pending_index];
-        app.pending = bluez.connectAsync(app.conn, dev) catch |e| {
+        app.pending = (switch (app.pending_kind) {
+            .pair => bluez.pairAsync(app.conn, dev),
+            .connect => bluez.connectAsync(app.conn, dev),
+        }) catch |e| {
             fail(app, @errorName(e).ptr);
             return;
         };
@@ -505,7 +558,7 @@ fn renderDevices(app: *App) void {
     const state_text: [:0]const u8 = switch (app.mode) {
         .list => "Ready",
         .scanning => "Scanning...",
-        .working => "Connecting...",
+        .working => if (app.pending_kind == .pair) "Pairing..." else "Connecting...",
         .err => "Error",
     };
     ui.text(app.ui, 8, 8, "Bluetooth", app.pal.fg);
