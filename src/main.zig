@@ -239,6 +239,11 @@ const App = struct {
     retry_scheduled: bool = false,
     retry_at_ms: u32 = 0,
 
+    // Set by `fail` when it fires mid-`.working`; cleared by the frame loop,
+    // which refreshes once at the top of the next iteration when it's set.
+    // See `fail`'s doc comment (final review, finding I2).
+    needs_refresh: bool = false,
+
     quit: bool = false,
 };
 
@@ -291,7 +296,24 @@ fn captureResumeMode(app: *App) void {
 /// Single entry point for "something failed, show it": captures the resume
 /// target before switching, so every failure site returns to wherever the
 /// user actually was.
+///
+/// Final review, finding I2 (structural fix): also marks `app.needs_refresh`
+/// whenever a failure exits `.working` - `pairAsync`/`connectAsync` can
+/// leave the device in a different `paired`/`connected` state than
+/// `app.devices` still shows (pairing that succeeded before a later step
+/// failed, most notably), and the row must not go on reading stale state
+/// with no advertised way out. Fix round 1's I2 patch added `refreshDevices`
+/// at the two exits the reviewer named at the time; a later review found a
+/// third, unnamed one reachable through an ordinary flow - the actual
+/// requirement was always "every exit from `.working`", which only holds by
+/// construction if `fail` itself guarantees it, not if every call site has
+/// to remember to ask for it. The frame loop performs the actual refresh at
+/// the top of its next iteration (see `runUi`) rather than here, so this
+/// can never recurse into itself if the refresh itself fails - by the time
+/// that runs, `app.mode` is already `.err`, not `.working`, so a nested
+/// `fail` call doesn't re-arm the flag.
 fn fail(app: *App, text: [*c]const u8) void {
+    if (app.mode == .working) app.needs_refresh = true;
     captureResumeMode(app);
     setStatus(app, text);
     app.mode = .err;
@@ -492,7 +514,10 @@ fn handleInput(app: *App, btn: ui.Button) void {
             // on connect-success - otherwise a cancelled-but-completed pair
             // leaves the row reading unpaired while BlueZ now disagrees,
             // and `a` re-routes into `Pair` again (AlreadyExists) with no
-            // way out except `y`, which the footer doesn't advertise.
+            // way out except `y`, which the footer doesn't advertise. This
+            // path exits `.working` without going through `fail` (the user
+            // chose to cancel, nothing failed), so it can't rely on `fail`'s
+            // `needs_refresh` flag and refreshes explicitly instead.
             refreshDevices(app);
             if (app.mode == .working) app.mode = app.resume_mode;
         }
@@ -569,11 +594,10 @@ fn updatePending(app: *App) void {
                     _ = c.printf("setTrusted failed (continuing to connect anyway): %s\n", trust_err.text());
                 };
                 const pending2 = bluez.connectAsync(app.conn, dev) catch |e| {
-                    // Finding I2: the device is genuinely paired now even
-                    // though this connect attempt never got off the
-                    // ground - refresh so the row reflects that instead of
-                    // still reading unpaired.
-                    refreshDevices(app);
+                    // The device is genuinely paired now even though this
+                    // connect attempt never got off the ground; `fail`
+                    // itself flags the refresh (see its doc comment) rather
+                    // than doing it here directly.
                     fail(app, @errorName(e).ptr);
                     return;
                 };
@@ -737,6 +761,17 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
     };
 
     while (!app.quit) {
+        // Structural half of finding I2's fix: `fail` flags this instead of
+        // refreshing directly, so every current and future exit from
+        // `.working` via failure gets one, without each call site having to
+        // remember to ask for it. Checked first, before this frame's own
+        // input/pending handling, so the row is never stale for a frame
+        // longer than it has to be.
+        if (app.needs_refresh) {
+            app.needs_refresh = false;
+            refreshDevices(&app);
+        }
+
         conn.pump();
 
         while (ui.poll(app.ui)) |btn| {
