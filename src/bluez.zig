@@ -197,8 +197,27 @@ pub const agent_path = "/muos/btui/agent";
 /// instead of recovered from the incoming message.
 var agent_conn: ?*c.DBusConnection = null;
 
+/// First object-path (or string) argument of the incoming call, if any -
+/// the device the request concerns for RequestConfirmation/
+/// RequestAuthorization/AuthorizeService. Release/Cancel take no arguments,
+/// so "(none)" there is expected, not a parsing failure.
+fn firstPathArg(msg: ?*c.DBusMessage) [*c]const u8 {
+    var it: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(msg, &it) == 0) return "(none)";
+    const t = c.dbus_message_iter_get_arg_type(&it);
+    if (t != c.DBUS_TYPE_OBJECT_PATH and t != c.DBUS_TYPE_STRING) return "(none)";
+    return dbus.iterString(&it);
+}
+
+/// Logs every callback (method name + the device it concerns) and the reply
+/// send, on stdout via `c.printf` like the rest of the file - this agent is
+/// the single largest untested surface in the project (see task-8-report.md),
+/// so a real pairing session needs evidence in the transcript that these
+/// fired at all, not just silent auto-accept.
 fn agentMessage(_: ?*c.DBusConnection, msg: ?*c.DBusMessage, _: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
     const member = c.dbus_message_get_member(msg);
+    _ = c.printf("agent: %s %s\n", member, firstPathArg(msg));
+
     // Every method we accept returns an empty reply; rejecting is never needed
     // for NoInputNoOutput pairing.
     if (c.strcmp(member, "RequestConfirmation") == 0 or
@@ -210,6 +229,7 @@ fn agentMessage(_: ?*c.DBusConnection, msg: ?*c.DBusMessage, _: ?*anyopaque) cal
         const reply = c.dbus_message_new_method_return(msg);
         _ = c.dbus_connection_send(agent_conn, reply, null);
         c.dbus_message_unref(reply);
+        _ = c.printf("agent: %s reply sent\n", member);
         return c.DBUS_HANDLER_RESULT_HANDLED;
     }
     return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -230,8 +250,12 @@ pub fn registerAgent(conn: dbus.Connection) !void {
 
     var err = dbus.Error{};
     defer err.deinit();
-    const r1 = try conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", &.{ .{ .obj = agent_path }, .{ .str = "NoInputNoOutput" } }, &err);
+    const r1 = conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", &.{ .{ .obj = agent_path }, .{ .str = "NoInputNoOutput" } }, &err) catch |e| {
+        _ = c.printf("agent: RegisterAgent failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return e;
+    };
     c.dbus_message_unref(r1);
+    _ = c.printf("agent: RegisterAgent succeeded\n");
 
     // Best-effort: BlueZ routes a client's own Pair() calls to whichever
     // agent that same connection registered, so being *default* is not
@@ -244,5 +268,8 @@ pub fn registerAgent(conn: dbus.Connection) !void {
     defer err2.deinit();
     if (conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", &.{.{ .obj = agent_path }}, &err2)) |r2| {
         c.dbus_message_unref(r2);
-    } else |_| {}
+        _ = c.printf("agent: RequestDefaultAgent succeeded\n");
+    } else |e| {
+        _ = c.printf("agent: RequestDefaultAgent failed (best-effort, ignored): %s (%s)\n", @errorName(e).ptr, err2.text());
+    }
 }
