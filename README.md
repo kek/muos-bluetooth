@@ -107,12 +107,31 @@ confirmation is needed; if one does prompt, `agent on` in an interactive
 
 ## Audio
 
-WirePlumber picks up the new sink by itself — on a connected A2DP headset the
-default sink switches automatically and running streams follow. Check with:
+**Connecting a headset is not enough to hear anything.** WirePlumber creates a
+working sink for it, but muOS keeps the *default* sink on the internal card — it
+has no idea Bluetooth exists on these builds — so audio keeps going to the
+speaker while a perfectly healthy Bluetooth sink sits idle. The symptom is
+"connected, no sound":
+
+```
+Sinks:   33. Built-in Audio Stereo   [vol: 0.40]
+      *  34. Built-in Audio Stereo   [vol: 0.00]   <- default, and silent
+         49. LE-Constantin           [vol: 0.24]   <- your headset, unused
+Streams: retroarch -> Stereo:playback_FL/FR        <- pinned to the built-in
+```
+
+The bring-up hook now handles this at boot: it reconnects paired devices and
+points the default sink at the Bluetooth one. For anything that connects later,
+or to switch back and forth:
 
 ```sh
-wpctl status
+sh /mnt/mmc/MUOS/bluetooth/bt-audio.sh            # what is default right now
+sh /mnt/mmc/MUOS/bluetooth/bt-audio.sh use 0.6    # default -> Bluetooth, volume 0.6
+sh /mnt/mmc/MUOS/bluetooth/bt-audio.sh internal   # default -> built-in speaker
 ```
+
+Changing the default also moves streams that are already playing, so you don't
+have to restart the emulator.
 
 If you ever need to route by hand, note which object you're addressing:
 
@@ -131,6 +150,27 @@ Bluetooth sink. Likewise nothing in a pre-native build knows a Bluetooth
 *controller* exists — RetroArch has autoconfigs for several and SDL will
 enumerate it, but the frontend's input mapping is built around the internal pad.
 Those two gaps are exactly what the native feature fixes.
+
+## Troubleshooting
+
+**Connected, but no sound.** The default sink is still the internal card — see
+[Audio](#audio). `bt-audio.sh use` fixes it.
+
+**No Bluetooth sink exists at all.** Then nothing is actually connected, whatever
+the headset's own indicator says. `bluetoothctl devices Connected` is the truth.
+Paired is not connected: after a cold boot the handheld has to *initiate* the
+reconnect, which is what the hook's autoconnect step does.
+
+**The tools report nothing / every sink looks missing.** `wpctl` and `pw-dump`
+need `PIPEWIRE_RUNTIME_DIR` and `XDG_RUNTIME_DIR`, which muOS exports from
+`script/var/func.sh`. Run them over a plain `ssh device 'command'` without those
+and PipeWire looks empty rather than erroring. The scripts here set both
+defensively; if you poke at PipeWire by hand, use `ssh device` interactively or
+prefix `XDG_RUNTIME_DIR=/run PIPEWIRE_RUNTIME_DIR=/run`.
+
+**Check the hook actually ran.** `tail /mnt/mmc/MUOS/log/bluetooth.log`. It is
+idempotent, so you can re-run it any time:
+`sh /mnt/mmc/MUOS/init/10-bluetooth.sh`.
 
 ## Verify
 

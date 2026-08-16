@@ -21,6 +21,12 @@ HCI_TTY=/dev/ttyS1
 HCI_SPEED=115200
 HCI_PROTO=rtk_h5
 
+# The PipeWire tools used at the end need these to find the daemon socket.
+# muOS exports them from script/var/func.sh, so they are normally inherited at
+# boot - set them anyway so the script also works when run by hand over ssh.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run}"
+export PIPEWIRE_RUNTIME_DIR="${PIPEWIRE_RUNTIME_DIR:-/run}"
+
 LOG=/mnt/mmc/MUOS/log/bluetooth.log
 [ -d "$(dirname "$LOG")" ] || LOG=/tmp/bluetooth.log
 exec >>"$LOG" 2>&1
@@ -108,4 +114,57 @@ done
 
 bluetoothctl power on >/dev/null 2>&1
 say "controller: $(bluetoothctl show 2>/dev/null | head -1)"
+
+# Reconnect paired devices. BlueZ will not initiate this by itself, and on a
+# build without native Bluetooth there is nothing else to do it either -
+# upstream muOS calls `bt_device.sh autoconnect` at exactly this point.
+CONNECTED=0
+for MAC in $(bluetoothctl devices Paired 2>/dev/null | awk '{ print $2 }'); do
+	if bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"; then
+		say "$MAC already connected"
+		CONNECTED=1
+		continue
+	fi
+
+	n=0
+	while [ "$n" -lt 3 ]; do
+		bluetoothctl connect "$MAC" >/dev/null 2>&1
+		sleep 2
+		if bluetoothctl info "$MAC" 2>/dev/null | grep -q "Connected: yes"; then
+			say "connected $MAC"
+			CONNECTED=1
+			break
+		fi
+		n=$((n + 1))
+	done
+
+	[ "$n" -ge 3 ] && say "could not connect $MAC (powered off or out of range)"
+done
+
+# muOS keeps the default sink on the internal card - it has no idea Bluetooth
+# exists here - so a connected headset otherwise ends up with a working sink
+# that nothing plays to. Waiting for the sink also waits for PipeWire itself.
+if [ "$CONNECTED" -eq 1 ]; then
+	BT_SINK=""
+	n=0
+	while [ "$n" -lt 20 ]; do
+		BT_SINK=$(pw-cli ls Node 2>/dev/null | awk '
+			/^[[:space:]]*id [0-9]+,/ { gsub(/,/, "", $2); id = $2 }
+			/node.name = "bluez_output/ { print id; exit }')
+		[ -n "$BT_SINK" ] && break
+		sleep 1
+		n=$((n + 1))
+	done
+
+	if [ -n "$BT_SINK" ]; then
+		if wpctl set-default "$BT_SINK" 2>/dev/null; then
+			say "default sink -> node $BT_SINK (bluetooth)"
+		else
+			say "could not set node $BT_SINK as default"
+		fi
+	else
+		say "device connected but no bluetooth sink appeared"
+	fi
+fi
+
 say "=== bring-up complete ==="
