@@ -57,13 +57,40 @@ fn dumpMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
 /// Starts discovery, gives the adapter a few seconds to hear back from
 /// nearby devices, then stops and prints the device list like `--dump`.
 fn scanMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
-    try bluez.startScan(conn);
+    var err = dbus.Error{};
+    defer err.deinit();
+
+    bluez.startScan(conn, &err) catch |e| {
+        _ = c.printf("scan failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     _ = c.sleep(8);
-    try bluez.stopScan(conn);
+    bluez.stopScan(conn, &err) catch |e| {
+        _ = c.printf("scan failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
 
     const devices = try bluez.list(gpa, conn);
     defer bluez.freeList(gpa, devices);
     printDevices(devices);
+}
+
+/// Registers the NoInputNoOutput pairing agent (see `bluez.registerAgent`)
+/// and holds the bus connection open for a few seconds, pumping it, so the
+/// registration round-trip actually runs once on real hardware. Exercising
+/// this from a real pairing is Task 8's job; this only proves registration
+/// itself - the two-argument `RegisterAgent` marshalling, the vtable wiring,
+/// and `agentMessage`'s reply path - has run at all. Self-reverting: BlueZ
+/// releases the agent when this process exits and the connection drops.
+fn agentMode(conn: dbus.Connection) !void {
+    try bluez.registerAgent(conn);
+    _ = c.printf("agent registered at %s\n", @as([*c]const u8, bluez.agent_path));
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        conn.pump();
+        _ = c.sleep(1);
+    }
+    _ = c.printf("agent mode done\n");
 }
 
 /// Non-blocking connect: polls the `Pending` from `bluez.connectAsync` on the
@@ -105,7 +132,13 @@ fn forgetMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u8
         _ = c.printf("no device with address %s\n", address.ptr);
         return;
     };
-    try bluez.forget(conn, dev);
+
+    var err = dbus.Error{};
+    defer err.deinit();
+    bluez.forget(conn, dev, &err) catch |e| {
+        _ = c.printf("forget failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
 
     const after = try bluez.list(gpa, conn);
     defer bluez.freeList(gpa, after);
@@ -144,6 +177,13 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (flagValue(init.args, "--forget")) |address| {
         forgetMode(gpa, conn, address) catch |e| {
             _ = c.printf("forget failed: %s\n", @errorName(e).ptr);
+        };
+        return;
+    }
+
+    if (hasFlag(init.args, "--agent")) {
+        agentMode(conn) catch |e| {
+            _ = c.printf("agent failed: %s\n", @errorName(e).ptr);
         };
         return;
     }

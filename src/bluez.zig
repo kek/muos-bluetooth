@@ -137,44 +137,45 @@ pub fn freeList(gpa: std.mem.Allocator, devices: []Device) void {
 
 pub const adapter_path = "/org/bluez/hci0";
 
-fn deviceCall(conn: dbus.Connection, dev: Device, method: [*c]const u8) !void {
-    var err = dbus.Error{};
-    const reply = try conn.call("org.bluez", dev.path.ptr, "org.bluez.Device1", method, &err);
+// Every blocking verb below takes `err` from the caller rather than
+// allocating its own and discarding it: a discarded `Error` means the
+// operator only ever sees the bare Zig error (`CallFailed`), never the
+// actual D-Bus reason (e.g. `org.bluez.Error.DoesNotExist`). The caller owns
+// `err` and must `defer err.deinit()` to free the strings libdbus
+// heap-allocates into it.
+
+fn deviceCall(conn: dbus.Connection, dev: Device, method: [*c]const u8, err: *dbus.Error) !void {
+    const reply = try conn.call("org.bluez", dev.path.ptr, "org.bluez.Device1", method, err);
     c.dbus_message_unref(reply);
 }
 
 /// Blocking: `Disconnect` returns promptly, unlike `Connect`/`Pair` (see
 /// `connectAsync`/`pairAsync`).
-pub fn disconnect(conn: dbus.Connection, dev: Device) !void {
-    return deviceCall(conn, dev, "Disconnect");
+pub fn disconnect(conn: dbus.Connection, dev: Device, err: *dbus.Error) !void {
+    return deviceCall(conn, dev, "Disconnect", err);
 }
 
-pub fn startScan(conn: dbus.Connection) !void {
-    var err = dbus.Error{};
-    const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StartDiscovery", &err);
+pub fn startScan(conn: dbus.Connection, err: *dbus.Error) !void {
+    const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StartDiscovery", err);
     c.dbus_message_unref(reply);
 }
 
-pub fn stopScan(conn: dbus.Connection) !void {
-    var err = dbus.Error{};
-    const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StopDiscovery", &err);
+pub fn stopScan(conn: dbus.Connection, err: *dbus.Error) !void {
+    const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StopDiscovery", err);
     c.dbus_message_unref(reply);
 }
 
-pub fn forget(conn: dbus.Connection, dev: Device) !void {
-    var err = dbus.Error{};
-    const reply = try conn.callArgs("org.bluez", adapter_path, "org.bluez.Adapter1", "RemoveDevice", &.{.{ .obj = dev.path.ptr }}, &err);
+pub fn forget(conn: dbus.Connection, dev: Device, err: *dbus.Error) !void {
+    const reply = try conn.callArgs("org.bluez", adapter_path, "org.bluez.Adapter1", "RemoveDevice", &.{.{ .obj = dev.path.ptr }}, err);
     c.dbus_message_unref(reply);
 }
 
-pub fn setTrusted(conn: dbus.Connection, dev: Device, on: bool) !void {
-    var err = dbus.Error{};
-    try conn.setBoolProperty(dev.path.ptr, "org.bluez.Device1", "Trusted", on, &err);
+pub fn setTrusted(conn: dbus.Connection, dev: Device, on: bool, err: *dbus.Error) !void {
+    try conn.setBoolProperty(dev.path.ptr, "org.bluez.Device1", "Trusted", on, err);
 }
 
-pub fn powerOn(conn: dbus.Connection) !void {
-    var err = dbus.Error{};
-    try conn.setBoolProperty(adapter_path, "org.bluez.Adapter1", "Powered", true, &err);
+pub fn powerOn(conn: dbus.Connection, err: *dbus.Error) !void {
+    try conn.setBoolProperty(adapter_path, "org.bluez.Adapter1", "Powered", true, err);
 }
 
 /// Non-blocking: `Connect` can take many seconds. The caller polls the
@@ -219,16 +220,29 @@ var agent_vtable = c.DBusObjectPathVTable{
     .message_function = agentMessage,
 };
 
-/// Registers a NoInputNoOutput agent and makes it the default. BlueZ never
-/// asks this agent for a PIN or confirmation - it auto-accepts just-works
-/// pairing, which is what every gamepad and headset uses. Without an agent
-/// registered at all, `Device1.Pair` fails outright.
+/// Registers a NoInputNoOutput agent and, best-effort, asks to be the
+/// default. BlueZ never asks this agent for a PIN or confirmation - it
+/// auto-accepts just-works pairing, which is what every gamepad and headset
+/// uses. Without an agent registered at all, `Device1.Pair` fails outright.
 pub fn registerAgent(conn: dbus.Connection) !void {
     agent_conn = conn.handle;
     _ = c.dbus_connection_register_object_path(conn.handle, agent_path, &agent_vtable, null);
+
     var err = dbus.Error{};
+    defer err.deinit();
     const r1 = try conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", &.{ .{ .obj = agent_path }, .{ .str = "NoInputNoOutput" } }, &err);
     c.dbus_message_unref(r1);
-    const r2 = try conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", &.{.{ .obj = agent_path }}, &err);
-    c.dbus_message_unref(r2);
+
+    // Best-effort: BlueZ routes a client's own Pair() calls to whichever
+    // agent that same connection registered, so being *default* is not
+    // required for our own pairing to work. Something else on the box
+    // (bluetoothctl, another agent) may already hold the default slot -
+    // if RequestDefaultAgent fails, don't undo the successful RegisterAgent
+    // above, or every retry would hit org.bluez.Error.AlreadyExists for the
+    // rest of the process's life.
+    var err2 = dbus.Error{};
+    defer err2.deinit();
+    if (conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", &.{.{ .obj = agent_path }}, &err2)) |r2| {
+        c.dbus_message_unref(r2);
+    } else |_| {}
 }

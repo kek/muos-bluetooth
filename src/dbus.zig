@@ -21,6 +21,15 @@ pub const Error = extern struct {
     pub fn text(self: *Error) [*c]const u8 {
         return if (self.message) |m| m else "(no detail)";
     }
+
+    /// Frees the name/message strings libdbus heap-allocates when a call
+    /// fills this Error. Safe to call on an Error that was never set, and
+    /// safe to call twice - `dbus_error_free` no-ops when `name` is already
+    /// null. Callers that own an `Error` across a call (to read `.text()` on
+    /// failure) must `defer err.deinit()` or leak those strings.
+    pub fn deinit(self: *Error) void {
+        c.dbus_error_free(self.ptr());
+    }
 };
 
 pub const DBusFailure = error{ ConnectFailed, CallFailed };
@@ -38,16 +47,38 @@ pub const Arg = union(enum) {
 pub const Pending = struct {
     call: ?*c.DBusPendingCall,
 
+    /// True once a reply has arrived, and also once `take()` or `deinit()`
+    /// has already consumed this `Pending` - a caller that polls `done()`
+    /// after taking the reply must not see it flip back to "not done".
     pub fn done(self: Pending) bool {
-        return c.dbus_pending_call_get_completed(self.call) != 0;
+        return self.call == null or c.dbus_pending_call_get_completed(self.call) != 0;
     }
 
-    /// Consumes the pending call. Returns the reply, which may itself be an
-    /// error message - check with `errorName`.
-    pub fn take(self: Pending) ?*c.DBusMessage {
-        const reply = c.dbus_pending_call_steal_reply(self.call);
-        c.dbus_pending_call_unref(self.call);
+    /// Consumes the pending call, exactly once: `self.call` is nulled before
+    /// the reply is stolen, so a second `take()` (or a `done()` after this)
+    /// sees an already-empty `Pending` instead of touching a freed
+    /// `DBusPendingCall`. Returns the reply, which may itself be an error
+    /// message - check with `errorName`. Returns null if already consumed.
+    pub fn take(self: *Pending) ?*c.DBusMessage {
+        const call = self.call orelse return null;
+        self.call = null;
+        const reply = c.dbus_pending_call_steal_reply(call);
+        c.dbus_pending_call_unref(call);
         return reply;
+    }
+
+    /// Releases the pending call without caring about its reply: cancels it
+    /// (so a notify callback, if one were ever registered, would not fire),
+    /// steals and discards whatever reply is sitting there so it isn't
+    /// leaked, then unrefs. Idempotent - safe after `take()` or a previous
+    /// `deinit()`. For the frame loop's cancel path (e.g. the user backs out
+    /// of a connect/pair modal before it completes).
+    pub fn deinit(self: *Pending) void {
+        const call = self.call orelse return;
+        self.call = null;
+        if (c.dbus_pending_call_get_completed(call) == 0) c.dbus_pending_call_cancel(call);
+        if (c.dbus_pending_call_steal_reply(call)) |reply| c.dbus_message_unref(reply);
+        c.dbus_pending_call_unref(call);
     }
 };
 
