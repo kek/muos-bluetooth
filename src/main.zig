@@ -6,11 +6,16 @@ const c = @cImport({
     @cInclude("dbus/dbus.h");
     @cInclude("stdio.h");
 });
+const dbus = @import("dbus.zig");
 
 pub const version = "0.1.0";
 
 pub fn main() void {
-    var sdl: c.SDL_version = undefined;
-    c.SDL_GetVersion(&sdl);
-    _ = c.printf("btui %s (SDL %d.%d.%d)\n", version.ptr, sdl.major, sdl.minor, sdl.patch);
+    var err = dbus.Error{};
+    const conn = dbus.connectSystem(&err) catch {
+        _ = c.printf("bus connect failed: %s\n", err.text());
+        return;
+    };
+    _ = conn;
+    _ = c.printf("connected to system bus\n");
 }
