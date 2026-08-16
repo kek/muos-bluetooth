@@ -168,6 +168,24 @@ and PipeWire looks empty rather than erroring. The scripts here set both
 defensively; if you poke at PipeWire by hand, use `ssh device` interactively or
 prefix `XDG_RUNTIME_DIR=/run PIPEWIRE_RUNTIME_DIR=/run`.
 
+**Audio breaks up during play.** muOS allows a quantum up to 2048
+(`default.clock.max-quantum` in its `pipewire.conf`) and the bluez sink takes the
+maximum, so the A2DP transport gets one ~46 ms burst per period. Bluetooth and
+WiFi share a single 2.4 GHz front end on these Realtek combo chips, and a burst
+that big is much likelier to miss its transmission window than four small ones.
+The hook and `bt-audio.sh use` therefore force the quantum down:
+
+```sh
+pw-metadata -n settings 0 clock.force-quantum 512   # what we set
+pw-metadata -n settings 0 clock.force-quantum 0     # back to muOS's default
+```
+
+Measured on an RG40XX V with a Bose NC 700: SNES emulation broke up
+intermittently at 2048 and was clean at 512, with `pw-top` reporting `ERR 0`
+(no xruns) in *both* cases — i.e. the dropouts were on the radio link, not in
+the audio pipeline. Latency improved only marginally; stability was the win.
+Set `BT_QUANTUM=0` to opt out, or raise it if emulators start crackling.
+
 **Check the hook actually ran.** `tail /mnt/mmc/MUOS/log/bluetooth.log`. It is
 idempotent, so you can re-run it any time:
 `sh /mnt/mmc/MUOS/init/10-bluetooth.sh`.

@@ -19,6 +19,19 @@ set -u
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run}"
 export PIPEWIRE_RUNTIME_DIR="${PIPEWIRE_RUNTIME_DIR:-/run}"
 
+# muOS allows a quantum up to 2048 and the bluez sink takes the maximum, which
+# means one ~46ms burst of A2DP data per period. On these Realtek combo chips
+# Bluetooth and WiFi time-slice a single 2.4GHz front end, and a burst that big
+# is far likelier to miss its transmission window than four small ones - the
+# symptom is audio breaking up during play. 512 fixed that here, with no xruns
+# (pw-top ERR stayed 0). Raise it again if emulators start crackling.
+BT_QUANTUM=${BT_QUANTUM:-512}
+
+set_quantum() { # set_quantum <frames|0 to unforce>
+	command -v pw-metadata >/dev/null 2>&1 || return 0
+	pw-metadata -n settings 0 clock.force-quantum "$1" >/dev/null 2>&1
+}
+
 # Node id of the first bluez_output.* sink, empty if none.
 bt_sink_id() {
 	if command -v jq >/dev/null 2>&1; then
@@ -70,8 +83,9 @@ case "${1:-status}" in
 		fi
 		wpctl set-default "$BT"
 		[ -n "${2:-}" ] && wpctl set-volume "$BT" "$2"
+		set_quantum "$BT_QUANTUM"
 		sleep 1
-		echo "default is now node $BT"
+		echo "default is now node $BT (quantum forced to $BT_QUANTUM)"
 		show
 		;;
 	internal)
@@ -81,8 +95,9 @@ case "${1:-status}" in
 			exit 1
 		fi
 		wpctl set-default "$AL"
+		set_quantum 0
 		sleep 1
-		echo "default is now node $AL (internal)"
+		echo "default is now node $AL (internal, quantum back to muOS default)"
 		show
 		;;
 	*)

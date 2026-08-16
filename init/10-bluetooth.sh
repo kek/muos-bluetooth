@@ -162,6 +162,20 @@ if [ "$CONNECTED" -eq 1 ]; then
 		else
 			say "could not set node $BT_SINK as default"
 		fi
+
+		# muOS allows a quantum up to 2048 and the bluez sink takes the
+		# maximum: one ~46ms burst of A2DP data per period. Bluetooth and
+		# WiFi share a single 2.4GHz front end on these Realtek combo
+		# chips, and a burst that big is far likelier to miss its
+		# transmission window than four small ones - audio breaks up
+		# during play. Smaller quantum, steadier feed. Set BT_QUANTUM=0
+		# to leave muOS's default alone.
+		BT_QUANTUM=${BT_QUANTUM:-512}
+		if [ "$BT_QUANTUM" -gt 0 ] 2>/dev/null; then
+			if pw-metadata -n settings 0 clock.force-quantum "$BT_QUANTUM" >/dev/null 2>&1; then
+				say "quantum forced to $BT_QUANTUM for bluetooth playback"
+			fi
+		fi
 	else
 		say "device connected but no bluetooth sink appeared"
 	fi
