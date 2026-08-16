@@ -3,8 +3,9 @@
 Turn on Bluetooth on Anbernic H700 handhelds running a muOS build that ships the
 whole BlueZ stack but has no Bluetooth support wired into the frontend yet.
 
-Nothing here installs any binaries. Every piece of software involved is already
-on the device — this repo is the ~90 lines of glue muOS hasn't shipped yet.
+Nothing here installs any vendored or third-party binaries — `btui` is built
+from the source in this repo, and every other piece of software involved is
+already on the device. This repo is the glue muOS hasn't shipped yet.
 
 Verified on an **RG40XX V** running **muOS 2601.1 "Funky Jacaranda"**.
 Should apply to any `rg*` board with a Realtek combo chip (RG40XX H/V, the
@@ -81,6 +82,14 @@ ssh root@<device-ip> 'sh /mnt/mmc/MUOS/init/10-bluetooth.sh; tail -20 /mnt/mmc/M
 
 ### `btui` development builds
 
+Building `btui` at all (rather than just installing an already-built one)
+needs `make sysroot && make build` on a machine with the Homebrew SDL2/dbus
+headers (`brew install sdl2 sdl2_ttf dbus`) — `make sysroot` pulls the
+device's own `.so` files over SSH as the link-time ABI reference (see
+`build.zig`), and `make build` cross-compiles against them. A bare `zig
+build` with no `-Dtarget` fails on a Mac: the pulled `.so` files are aarch64
+stubs a native-target build can't parse as valid libraries.
+
 The Zig Bluetooth UI (`src/`, `Makefile`) also reaches the device over SSH —
 `make sysroot` / `make deploy` / `make run`. Every one of those checks
 `/etc/os-release` for `MustardOS` before touching anything (`check-device` in
@@ -102,6 +111,14 @@ just gives you a menu-driven front end for the parts of the shell helpers
 that are otherwise SSH-only (scanning, pairing, connect/disconnect/forget,
 and choosing the audio sink).
 
+**`btui` does not bring the Bluetooth stack up by itself.** It only calls
+`Adapter1.Powered = true` on launch (best-effort) - if `bluetoothd` isn't on
+the bus at all (radio never attached, daemon never started), the Devices tab
+just fails every action with that reason rather than running the bring-up
+sequence itself. Make sure the boot hook has run (or bring the stack up by
+hand - see [Testing without installing](#testing-without-installing)) before
+opening the app.
+
 There are two tabs, switched with `L1`/`R1`:
 
 | Tab | Purpose |
@@ -115,8 +132,8 @@ Controls:
 |---|---|
 | D-pad up/down | Move selection |
 | `A` | Devices: connect (or pair, then connect, if not yet paired). Audio: set the selected sink as default |
-| `B` | Quit `btui`, back to muOS |
-| `X` | Forget the selected device (Devices tab only) |
+| `B` | Quit `btui`, back to muOS (during a pair/connect: cancel it instead) |
+| `X` | Forget the selected device (Devices tab only) — press again within ~3s to confirm; anything else cancels it |
 | `Y` | Start/stop a scan (Devices tab only) |
 | `L1` / `R1` | Switch tab |
 
@@ -320,7 +337,38 @@ works, but on this device its ~17 MB of vendored aarch64 binaries — BlueZ,
 `expect`, the PipeWire bluez5 codecs, an OpenSSL 1.1.1f from Ubuntu 20.04 — are
 all redundant: newer copies are already in the muOS image. Its installer also
 pulls an unpinned `main.zip` at install time and runs it as root at every boot.
-This repo takes the opposite approach: no binaries, use what's already there.
+This repo takes the opposite approach: no vendored or third-party binaries —
+`btui` is built from the source here, everything else is already there.
+
+## Deviations from the design spec
+
+Fix round 2, finding M14 — recorded here as explicit, intentional gaps
+against `docs/superpowers/specs/2026-08-16-bluetooth-ui-design.md` rather
+than left silently dropped:
+
+- **No clock/battery in the header.** The spec's header called for "title,
+  adapter state, clock/battery", matching muOS's own screens. `btui`'s header
+  is just the title and a state line (`Ready`/`Scanning...`/etc.).
+- **No `bluez.onChange` signal matching.** The spec called for a
+  `PropertiesChanged`/`InterfacesAdded`/`InterfacesRemoved` D-Bus signal
+  matcher so the device list updates live during a scan. `btui` instead polls
+  `bluez.list()` on a fixed interval while scanning (`scan_refresh_ms`) -
+  works, but isn't event-driven, and adds up to that interval's worth of
+  latency before a newly-discovered device shows up.
+- **No `Device.rssi`.** The spec's `Device` struct includes signal strength;
+  it isn't read, stored, or shown anywhere in this implementation.
+- **No vendored `third_party/` headers.** The spec called for the SDL2/dbus
+  headers to be vendored under `third_party/` so builds are reproducible.
+  `build.zig` instead points at hardcoded Homebrew include paths
+  (`/opt/homebrew/include` etc.), so a build only works on a machine with
+  those installed at those paths - see [`btui` development
+  builds](#btui-development-builds).
+- **No photo in this README.** The spec's testing section called for a photo
+  of the UI running on hardware. None is included - interactive on-device
+  verification of the finished UI is still pending as of this writing (the
+  dev machine's network access to the handheld has been intermittent; see
+  the task reports under `.superpowers/sdd/2026-08-16-bluetooth-ui/` for the
+  current state of hardware verification).
 
 ## Credits
 

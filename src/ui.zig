@@ -351,9 +351,14 @@ fn drawCentered(ren: *c.SDL_Renderer, font: *c.TTF_Font, y: c_int, s: [:0]const 
 
 /// Renders every frame so a human pressing buttons gets immediate on-screen
 /// feedback: title, the last event (large, roughly centred), a running
-/// event count, and seconds remaining. Exits on SDL_QUIT, `.b`, or after
-/// `timeout_ms`, whichever comes first. Every event is still printed to
-/// stdout exactly as before, for the log a reviewer reads afterwards.
+/// event count, and seconds remaining. Exits on `SDL_QUIT` or after
+/// `timeout_ms`, whichever comes first - fix round 2, finding M7: this
+/// doc comment previously also claimed a `.b` exit path, but the loop below
+/// only tracks raw button/hat events for on-screen display, with no case
+/// that returns early on any particular button; every button press up to
+/// the timeout is exactly what this test is for. Every event is still
+/// printed to stdout exactly as before, for the log a reviewer reads
+/// afterwards.
 ///
 /// Fix-round-1 addendum: the first version of this test created a window
 /// but never drew a single frame, so the screen kept showing whatever was

@@ -20,18 +20,44 @@ pub const Sink = struct {
 /// sinks exist" and is extremely misleading.
 const env_prefix = "XDG_RUNTIME_DIR=/run PIPEWIRE_RUNTIME_DIR=/run ";
 
+// Fix round 2, finding M5: `std.json.Value`'s `.object`/`.array`/`.string`/
+// `.integer` fields are a tagged union - reading the wrong one is illegal
+// behaviour (a Debug-only safety panic, undefined in the ReleaseSmall build
+// this ships as), not a catchable error. `pw-dump`'s JSON is less guaranteed
+// input than BlueZ's own D-Bus messages, which are already strongly typed by
+// the wire protocol itself - a real reply with `"info": null` (or any field
+// present but the wrong JSON type) would previously have been UB rather than
+// just an unmatched sink. Each helper checks the tag before returning the
+// payload, so every access below can stay an ordinary `orelse continue`.
+fn asObject(v: std.json.Value) ?std.json.ObjectMap {
+    return if (v == .object) v.object else null;
+}
+fn asArray(v: std.json.Value) ?std.json.Array {
+    return if (v == .array) v.array else null;
+}
+fn asString(v: std.json.Value) ?[]const u8 {
+    return if (v == .string) v.string else null;
+}
+fn asInteger(v: std.json.Value) ?i64 {
+    return if (v == .integer) v.integer else null;
+}
+
 pub fn parseSinks(gpa: std.mem.Allocator, json_text: []const u8) ![]Sink {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
     defer parsed.deinit();
 
+    const top = asArray(parsed.value) orelse return &.{};
+
     var default_name: []const u8 = "";
-    for (parsed.value.array.items) |obj| {
-        const md = obj.object.get("metadata") orelse continue;
-        for (md.array.items) |e| {
-            const key = e.object.get("key") orelse continue;
-            if (!std.mem.eql(u8, key.string, "default.audio.sink")) continue;
-            const val = e.object.get("value") orelse continue;
-            if (val.object.get("name")) |n| default_name = n.string;
+    for (top.items) |obj| {
+        const obj_map = asObject(obj) orelse continue;
+        const md = asArray(obj_map.get("metadata") orelse continue) orelse continue;
+        for (md.items) |e| {
+            const e_map = asObject(e) orelse continue;
+            const key = asString(e_map.get("key") orelse continue) orelse continue;
+            if (!std.mem.eql(u8, key, "default.audio.sink")) continue;
+            const val = asObject(e_map.get("value") orelse continue) orelse continue;
+            if (val.get("name")) |n| default_name = asString(n) orelse continue;
         }
     }
 
@@ -44,18 +70,19 @@ pub fn parseSinks(gpa: std.mem.Allocator, json_text: []const u8) ![]Sink {
         out.deinit(gpa);
     }
 
-    for (parsed.value.array.items) |obj| {
-        const info = obj.object.get("info") orelse continue;
-        const props = info.object.get("props") orelse continue;
-        const class = props.object.get("media.class") orelse continue;
-        if (!std.mem.eql(u8, class.string, "Audio/Sink")) continue;
+    for (top.items) |obj| {
+        const obj_map = asObject(obj) orelse continue;
+        const info = asObject(obj_map.get("info") orelse continue) orelse continue;
+        const props = asObject(info.get("props") orelse continue) orelse continue;
+        const class = asString(props.get("media.class") orelse continue) orelse continue;
+        if (!std.mem.eql(u8, class, "Audio/Sink")) continue;
 
         // Resolve every `orelse continue` before allocating anything below:
         // `continue` isn't an error unwind, so an errdefer registered before
         // it would never run and any prior dupe would leak silently.
-        const id = obj.object.get("id") orelse continue;
-        const name = (props.object.get("node.name") orelse continue).string;
-        const desc = if (props.object.get("node.description")) |d| d.string else name;
+        const id = asInteger(obj_map.get("id") orelse continue) orelse continue;
+        const name = asString(props.get("node.name") orelse continue) orelse continue;
+        const desc = if (props.get("node.description")) |d| (asString(d) orelse name) else name;
 
         // Each dupe gets its own errdefer so a failure on the second one
         // can't leak the first: both must be freed exactly once, whether
@@ -66,7 +93,7 @@ pub fn parseSinks(gpa: std.mem.Allocator, json_text: []const u8) ![]Sink {
         errdefer gpa.free(desc_dup);
 
         try out.append(gpa, .{
-            .id = @intCast(id.integer),
+            .id = @intCast(id),
             .name = name_dup,
             .description = desc_dup,
             .is_bluetooth = std.mem.startsWith(u8, name, "bluez_output"),

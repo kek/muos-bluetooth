@@ -20,7 +20,9 @@ pub fn build(b: *std.Build) void {
     mod.addLibraryPath(b.path("sysroot"));
     mod.linkSystemLibrary("SDL2", .{ .use_pkg_config = .no });
     mod.linkSystemLibrary("SDL2_ttf", .{ .use_pkg_config = .no });
-    mod.linkSystemLibrary("SDL2_image", .{ .use_pkg_config = .no });
+    // Fix round 2, finding M9: SDL2_image was linked (and `make sysroot`
+    // pulled it from the device) with nothing in `src/` ever calling an
+    // `IMG_*` function - a runtime dependency for nothing.
     mod.linkSystemLibrary("dbus-1", .{ .use_pkg_config = .no });
 
     const exe = b.addExecutable(.{ .name = "btui", .root_module = mod });

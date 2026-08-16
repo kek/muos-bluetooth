@@ -3,7 +3,6 @@ const std = @import("std");
 const c = @cImport({
     @cDefine("SDL_DISABLE_ARM_NEON_H", "1");
     @cInclude("SDL2/SDL.h");
-    @cInclude("dbus/dbus.h");
     @cInclude("stdio.h");
     @cInclude("unistd.h");
 });
@@ -84,7 +83,12 @@ fn printTheme(gpa: std.mem.Allocator) void {
 /// `--dump` is the project's main development feedback loop: it prints the
 /// device list over SSH with no UI involved.
 fn dumpMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
-    const devices = try bluez.list(gpa, conn);
+    var err = dbus.Error{};
+    defer err.deinit();
+    const devices = bluez.list(gpa, conn, &err) catch |e| {
+        _ = c.printf("list failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     defer bluez.freeList(gpa, devices);
     printDevices(devices);
     printSinks(gpa);
@@ -107,7 +111,10 @@ fn scanMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
         return;
     };
 
-    const devices = try bluez.list(gpa, conn);
+    const devices = bluez.list(gpa, conn, &err) catch |e| {
+        _ = c.printf("list failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     defer bluez.freeList(gpa, devices);
     printDevices(devices);
 }
@@ -133,7 +140,12 @@ fn agentMode(conn: dbus.Connection) !void {
 /// Non-blocking connect: polls the `Pending` from `bluez.connectAsync` on the
 /// bus connection, the same way the frame loop will in the real UI.
 fn connectMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u8) !void {
-    const devices = try bluez.list(gpa, conn);
+    var err = dbus.Error{};
+    defer err.deinit();
+    const devices = bluez.list(gpa, conn, &err) catch |e| {
+        _ = c.printf("list failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     defer bluez.freeList(gpa, devices);
 
     const dev = findByAddress(devices, address) orelse {
@@ -153,7 +165,10 @@ fn connectMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u
         }
     }
 
-    const after = try bluez.list(gpa, conn);
+    const after = bluez.list(gpa, conn, &err) catch |e| {
+        _ = c.printf("list failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     defer bluez.freeList(gpa, after);
     printDevices(after);
 }
@@ -162,7 +177,12 @@ fn connectMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u
 /// address: see Ruling B in the task-4 brief - the device's paired headset
 /// can only be re-paired with physical access we don't have.
 fn forgetMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u8) !void {
-    const devices = try bluez.list(gpa, conn);
+    var err = dbus.Error{};
+    defer err.deinit();
+    const devices = bluez.list(gpa, conn, &err) catch |e| {
+        _ = c.printf("list failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     defer bluez.freeList(gpa, devices);
 
     const dev = findByAddress(devices, address) orelse {
@@ -170,14 +190,15 @@ fn forgetMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u8
         return;
     };
 
-    var err = dbus.Error{};
-    defer err.deinit();
     bluez.forget(conn, dev, &err) catch |e| {
         _ = c.printf("forget failed: %s (%s)\n", @errorName(e).ptr, err.text());
         return;
     };
 
-    const after = try bluez.list(gpa, conn);
+    const after = bluez.list(gpa, conn, &err) catch |e| {
+        _ = c.printf("list failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        return;
+    };
     defer bluez.freeList(gpa, after);
     printDevices(after);
 }
@@ -217,6 +238,10 @@ const connect_retry_delay_ms: u32 = 1000;
 // route feel laggy once the sink does show up; 5s matches the task-9 brief.
 const audio_poll_interval_ms: u32 = 500;
 const audio_route_timeout_ms: u32 = 5000;
+
+// Fix round 2, finding I5 (team-lead ruling): how long a second `X` has to
+// arrive after the first before a forget is actually committed.
+const forget_confirm_window_ms: u32 = 3000;
 
 /// Owns the bus connection, SDL/font state, the current device list, and
 /// where the user is in the UI. `pending`/`pending_*`/`retry_*` exist so a
@@ -282,6 +307,17 @@ const App = struct {
     // same as `needs_refresh` does for devices.
     needs_sink_refresh: bool = false,
 
+    // Fix round 2, finding I5 (team-lead ruling): `X` no longer forgets on
+    // one press. The first press arms this (with the device's own address,
+    // same copy-not-reference reasoning as `pending_address` - the list can
+    // reorder underneath `selected` every ~500ms during a scan) and shows a
+    // confirmation prompt; only a second `X` on the *same* device within
+    // `forget_confirm_window_ms` actually commits. Any other button, a
+    // mismatched address, or letting the window lapse all disarm it instead.
+    forget_armed: bool = false,
+    forget_armed_at_ms: u32 = 0,
+    forget_armed_address: [32:0]u8 = std.mem.zeroes([32:0]u8),
+
     quit: bool = false,
 };
 
@@ -297,15 +333,16 @@ fn setStatus(app: *App, msg: [*c]const u8) void {
     app.status[n] = 0;
 }
 
-/// Copies `address` into `app.pending_address`, truncating to fit - same
-/// shape as `setStatus`. Called from `beginAsync` (mirroring
-/// `pending_is_audio`), not re-read later from `app.devices[app.pending_index]`,
-/// since a `refreshDevices` between the connect starting and finishing could
-/// reorder or reallocate that list before `pollAutoRoute` ever looks at it.
-fn setPendingAddress(app: *App, address: [:0]const u8) void {
-    const n = @min(address.len, app.pending_address.len - 1);
-    @memcpy(app.pending_address[0..n], address[0..n]);
-    app.pending_address[n] = 0;
+/// Copies `address` into `dst`, truncating to fit - same shape as
+/// `setStatus`. Used for both `pending_address` (Task 9 auto-route) and
+/// `forget_armed_address` (fix round 2, finding I5): both need a `Device`'s
+/// address to remain valid across a frame boundary, after which
+/// `app.devices` may have been reallocated or reordered - so both copy it
+/// rather than re-reading it later from `app.devices[some saved index]`.
+fn copyAddress(dst: *[32:0]u8, address: [:0]const u8) void {
+    const n = @min(address.len, dst.len - 1);
+    @memcpy(dst[0..n], address[0..n]);
+    dst[n] = 0;
 }
 
 /// Extracts the first string argument from a D-Bus error reply's body -
@@ -386,8 +423,10 @@ fn isScanning(app: *App) bool {
 /// `selected` so it never points past the end of a shrunk list (e.g. after
 /// `forget`).
 fn refreshDevices(app: *App) void {
-    const new_list = bluez.list(app.gpa, app.conn) catch |e| {
-        fail(app, @errorName(e).ptr);
+    var err = dbus.Error{};
+    defer err.deinit();
+    const new_list = bluez.list(app.gpa, app.conn, &err) catch {
+        fail(app, err.text());
         return;
     };
     bluez.freeList(app.gpa, app.devices);
@@ -404,11 +443,15 @@ fn refreshDevices(app: *App) void {
 /// one place that reloads `app.sinks`, so every caller (tab entry, `setDefault`)
 /// gets the free-before-replace and `sinks_selected` clamp for free instead
 /// of having to remember either at its own call site.
+///
+/// Fix round 2, finding M8: a failure here degrades to an empty `app.sinks`
+/// rather than routing through `fail()` - the spec calls for "PipeWire
+/// absence degrades the Audio tab to a message; the Devices tab still
+/// works", not an error modal blocking the whole app over a tab that has
+/// its own honest empty state (`renderAudio`'s "(no audio sinks found)",
+/// fix round 1's M2) already built for exactly this.
 fn refreshSinks(app: *App) void {
-    const new_list = audio.sinks(app.gpa) catch |e| {
-        fail(app, @errorName(e).ptr);
-        return;
-    };
+    const new_list: []audio.Sink = audio.sinks(app.gpa) catch &.{};
     audio.freeSinks(app.gpa, app.sinks);
     app.sinks = new_list;
     if (app.sinks.len == 0) {
@@ -456,7 +499,7 @@ fn beginAsync(app: *App, kind: PendingKind) void {
     app.pending_kind = kind;
     app.pending_index = app.selected;
     app.pending_is_audio = dev.isAudio();
-    setPendingAddress(app, dev.address);
+    copyAddress(&app.pending_address, dev.address);
     app.pending_retried = false;
     app.retry_scheduled = false;
     captureResumeMode(app);
@@ -468,6 +511,12 @@ fn beginAsync(app: *App, kind: PendingKind) void {
 /// the only non-blocking ones - see `App.pending`/`PendingKind` and
 /// `updatePending`.
 fn devicesAction(app: *App, btn: ui.Button) void {
+    // Fix round 2, finding I5: any button other than a qualifying second
+    // `.x` disarms a pending forget-confirmation - covers moving the
+    // selection, starting a connect/pair, toggling scan, or switching tabs,
+    // all of which mean the user has moved on rather than confirming.
+    if (app.forget_armed and btn != .x) app.forget_armed = false;
+
     switch (btn) {
         .up => {
             if (app.selected > 0) app.selected -= 1;
@@ -500,6 +549,30 @@ fn devicesAction(app: *App, btn: ui.Button) void {
         .x => {
             if (app.devices.len == 0) return;
             const dev = app.devices[app.selected];
+            const now = c.SDL_GetTicks();
+            // Team-lead ruling, finding I5: was one press, no confirmation -
+            // on a list that can reorder underneath `selected` every ~500ms
+            // during a scan, that let a single stray `X` destroy a real
+            // pairing (the exact risk this project went to lengths during
+            // testing never to take with the owner's own headset). A second
+            // press only commits if it's still armed, for *this* device
+            // (address, not index - the list may have reordered since the
+            // first press), within the window; anything else (re)arms
+            // instead of forgetting.
+            const confirmed = app.forget_armed and
+                now -% app.forget_armed_at_ms < forget_confirm_window_ms and
+                std.mem.eql(u8, std.mem.sliceTo(&app.forget_armed_address, 0), dev.address);
+            if (!confirmed) {
+                app.forget_armed = true;
+                app.forget_armed_at_ms = now;
+                copyAddress(&app.forget_armed_address, dev.address);
+                const label: [:0]const u8 = if (dev.alias.len == 0) dev.address else dev.alias;
+                var buf: [160:0]u8 = undefined;
+                const msg: [:0]const u8 = std.fmt.bufPrintZ(&buf, "press X again to forget {s}", .{label}) catch "press X again to forget";
+                setStatus(app, msg.ptr);
+                return;
+            }
+            app.forget_armed = false;
             var err = dbus.Error{};
             defer err.deinit();
             bluez.forget(app.conn, dev, &err) catch {
@@ -834,7 +907,23 @@ fn renderDevices(app: *App) void {
         .err => "Error",
     };
     ui.text(app.ui, 8, 8, "Bluetooth", app.pal.fg);
-    ui.text(app.ui, 8, 32, state_text, app.pal.dim);
+
+    // Fix round 2, finding I5: while a forget is armed and still inside its
+    // confirmation window, this replaces the ordinary state line with the
+    // prompt `.x`'s handler wrote into `app.status` (the same scratch
+    // buffer `fail`/`setStatus` use - guarded against `.err` below so an
+    // unrelated failure's text, which also lives there, can't get shown
+    // twice). Recomputing the window check here rather than trusting
+    // `app.forget_armed` alone means the prompt actually disappears once
+    // the window lapses, even if the user does nothing at all.
+    const now = c.SDL_GetTicks();
+    const show_forget_confirm = app.forget_armed and app.mode != .err and
+        now -% app.forget_armed_at_ms < forget_confirm_window_ms;
+    if (show_forget_confirm) {
+        ui.text(app.ui, 8, 32, std.mem.sliceTo(&app.status, 0), app.pal.accent);
+    } else {
+        ui.text(app.ui, 8, 32, state_text, app.pal.dim);
+    }
 
     // Clip to however many rows actually fit above the footer, scrolling
     // just enough to keep `selected` in view - a scan can return more
@@ -854,7 +943,16 @@ fn renderDevices(app: *App) void {
         ui.listRow(app.ui, i, offset + i == app.selected, left, right, app.pal);
     }
 
-    ui.text(app.ui, 8, ui.screen_h - 24, "A connect  X forget  Y scan  B exit", app.pal.dim);
+    // Fix round 2, findings I6/M11: `R1` (the entire "connected but
+    // silent" fix - the reason this project exists) was missing from this
+    // line entirely, and `A`/`X`/`Y` stayed listed even while `.working`
+    // ignores all three (see `handleInput`'s `.working` branch - only `.b`
+    // is live there).
+    const footer_text: [:0]const u8 = if (app.mode == .working)
+        "B cancel"
+    else
+        "A connect/pair  X forget  Y scan  R1 audio  B exit";
+    ui.text(app.ui, 8, ui.screen_h - 24, footer_text, app.pal.dim);
 }
 
 /// Audio tab: lists PipeWire sinks (`audio.sinks`, held in `app.sinks`),
@@ -919,7 +1017,12 @@ fn renderErrorModal(app: *App) void {
     ui.fillRect(app.ui, x, y, w, h, app.pal.bg);
 
     ui.text(app.ui, x + 8, y + 10, "ERROR", app.pal.accent);
-    ui.text(app.ui, x + 8, y + 38, &app.status, app.pal.fg);
+    // Fix round 2, finding M2: `&app.status` is always the full 128-byte
+    // array regardless of content, so `ui.hasText`'s zero-length check
+    // (meant to skip TTF_RenderUTF8_Blended's "zero width" failure on a
+    // genuinely empty string) could never actually see an empty status this
+    // way. `sliceTo` finds the real, null-terminated length instead.
+    ui.text(app.ui, x + 8, y + 38, std.mem.sliceTo(&app.status, 0), app.pal.fg);
     ui.text(app.ui, x + 8, y + 66, "press any button to continue", app.pal.dim);
 }
 
@@ -968,9 +1071,13 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
         .ui = sdl_ui,
         .pal = theme.palette(),
     };
-    // Runs last-declared-first-executed (LIFO): pending is cancelled, then
-    // discovery is stopped if still running, then the device list it may
-    // still reference by index is freed.
+    // These four `defer`s run last-declared-first-executed (LIFO), i.e. the
+    // reverse of the order they're written in below: sinks are freed first,
+    // then the device list, then discovery is stopped if it's still
+    // running, and only then is the still-live `pending` cancelled last -
+    // fix round 2, finding M6 (this comment previously described the
+    // opposite order, matching declaration order instead of actual
+    // execution order).
     defer if (app.pending) |*p| p.deinit();
     // Fix round 1, finding I4 (widened by fix round 2, finding G2 - see
     // `isScanning`): without this, quitting while discovery is still
@@ -986,8 +1093,10 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
     defer bluez.freeList(gpa, app.devices);
     defer audio.freeSinks(gpa, app.sinks);
 
-    app.devices = bluez.list(gpa, conn) catch |e| blk: {
-        fail(&app, @errorName(e).ptr);
+    var initial_list_err = dbus.Error{};
+    defer initial_list_err.deinit();
+    app.devices = bluez.list(gpa, conn, &initial_list_err) catch blk: {
+        fail(&app, initial_list_err.text());
         break :blk &.{};
     };
 
@@ -1023,7 +1132,11 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
 
         if (app.mode == .scanning) {
             const ticks = c.SDL_GetTicks();
-            if (ticks - app.last_refresh_ms >= scan_refresh_ms) {
+            // Fix round 2, finding M1: `-%` matches the wrap-safety already
+            // used everywhere else timestamps are subtracted in this file
+            // (`retry_at_ms`, `pollAutoRoute`'s `-%` throughout) - a plain
+            // `-` here traps under ReleaseSafe/Debug at the tick rollover.
+            if (ticks -% app.last_refresh_ms >= scan_refresh_ms) {
                 refreshDevices(&app);
                 app.last_refresh_ms = ticks;
             }
@@ -1035,6 +1148,16 @@ fn runUi(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
 }
 
 pub fn main(init: std.process.Init.Minimal) void {
+    // Fix round 2, finding I4: stdout is only line-buffered when it's a tty;
+    // under muOS packaging (no tty at all) it's fully buffered by default,
+    // so every `c.printf` diagnostic in this file - not just the
+    // agent-callback logging `bluez.zig` already flushes explicitly at each
+    // call site - is lost on a crash or `kill`, exactly the failure that
+    // logging was fixed for, but as an invariant here instead of a
+    // per-site fix. Set once, before anything else runs, so it covers every
+    // mode this binary can be invoked in, not just the interactive UI.
+    _ = c.setvbuf(c.stdout, null, c._IOLBF, 0);
+
     const gpa = std.heap.page_allocator;
 
     // SDL/UI test modes are self-contained and deliberately checked before

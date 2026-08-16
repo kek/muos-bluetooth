@@ -53,9 +53,17 @@ fn freeDevice(gpa: std.mem.Allocator, d: Device) void {
 
 /// Reads org.bluez's whole object tree and returns every org.bluez.Device1.
 /// Reply signature is a{oa{sa{sv}}}: path -> interface -> property -> variant.
-pub fn list(gpa: std.mem.Allocator, conn: dbus.Connection) ![]Device {
-    var err = dbus.Error{};
-    const reply = try conn.call("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", &err);
+///
+/// Fix round 2, finding I1: takes `err` from the caller instead of
+/// allocating and discarding its own, matching every blocking verb below
+/// (see the comment above `deviceCall`) - this is the one call site the
+/// project's own "caller owns `err`" convention never reached. Without it,
+/// a failure here (the hottest allocation path in the program - it runs
+/// every ~500ms during a scan) leaked libdbus's `name`/`message` strings on
+/// every occurrence and surfaced only the bare `CallFailed`, never BlueZ's
+/// actual reason (e.g. "`bluetoothd` not on the bus").
+pub fn list(gpa: std.mem.Allocator, conn: dbus.Connection, err: *dbus.Error) ![]Device {
+    const reply = try conn.call("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", err);
     defer c.dbus_message_unref(reply);
 
     var out: std.ArrayList(Device) = .empty;
@@ -65,7 +73,18 @@ pub fn list(gpa: std.mem.Allocator, conn: dbus.Connection) ![]Device {
     }
 
     var top: c.DBusMessageIter = undefined;
-    _ = c.dbus_message_iter_init(reply, &top);
+    // Fix round 2, finding M3: `dbus_message_iter_init`'s return and the
+    // top-level argument's type were never checked before recursing into
+    // it - a reply with no body, or whose first argument isn't the array
+    // `GetManagedObjects` always returns, would hand `dbus_message_iter_
+    // recurse` a container type it isn't. BlueZ is trusted to reply
+    // correctly in practice, but this is the one genuinely reachable arm of
+    // that concern, so it's worth closing structurally: degrade to an empty
+    // list rather than operate on an iterator that was never actually
+    // initialised as an array.
+    if (c.dbus_message_iter_init(reply, &top) == 0 or c.dbus_message_iter_get_arg_type(&top) != c.DBUS_TYPE_ARRAY) {
+        return out.toOwnedSlice(gpa);
+    }
     var objects: c.DBusMessageIter = undefined;
     c.dbus_message_iter_recurse(&top, &objects);
 
@@ -271,7 +290,17 @@ var agent_vtable = c.DBusObjectPathVTable{
 /// uses. Without an agent registered at all, `Device1.Pair` fails outright.
 pub fn registerAgent(conn: dbus.Connection) !void {
     agent_conn = conn.handle;
-    _ = c.dbus_connection_register_object_path(conn.handle, agent_path, &agent_vtable, null);
+    // Fix round 2, finding M4: this return value was previously discarded.
+    // A failure here means `agentMessage` never gets called at all - BlueZ's
+    // `RequestConfirmation`/`RequestAuthorization`/etc. callbacks below have
+    // nowhere to land - so `Pair` from the UI would just hang with no
+    // visible reason, on the single largest untested surface in the project
+    // (see task-8-report.md).
+    if (c.dbus_connection_register_object_path(conn.handle, agent_path, &agent_vtable, null) == 0) {
+        _ = libc.printf("agent: dbus_connection_register_object_path failed\n");
+        _ = libc.fflush(null);
+        return error.RegisterObjectPathFailed;
+    }
 
     var err = dbus.Error{};
     defer err.deinit();
