@@ -134,3 +134,101 @@ pub fn freeList(gpa: std.mem.Allocator, devices: []Device) void {
     for (devices) |d| freeDevice(gpa, d);
     gpa.free(devices);
 }
+
+pub const adapter_path = "/org/bluez/hci0";
+
+fn deviceCall(conn: dbus.Connection, dev: Device, method: [*c]const u8) !void {
+    var err = dbus.Error{};
+    const reply = try conn.call("org.bluez", dev.path.ptr, "org.bluez.Device1", method, &err);
+    c.dbus_message_unref(reply);
+}
+
+/// Blocking: `Disconnect` returns promptly, unlike `Connect`/`Pair` (see
+/// `connectAsync`/`pairAsync`).
+pub fn disconnect(conn: dbus.Connection, dev: Device) !void {
+    return deviceCall(conn, dev, "Disconnect");
+}
+
+pub fn startScan(conn: dbus.Connection) !void {
+    var err = dbus.Error{};
+    const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StartDiscovery", &err);
+    c.dbus_message_unref(reply);
+}
+
+pub fn stopScan(conn: dbus.Connection) !void {
+    var err = dbus.Error{};
+    const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StopDiscovery", &err);
+    c.dbus_message_unref(reply);
+}
+
+pub fn forget(conn: dbus.Connection, dev: Device) !void {
+    var err = dbus.Error{};
+    const reply = try conn.callArgs("org.bluez", adapter_path, "org.bluez.Adapter1", "RemoveDevice", &.{.{ .obj = dev.path.ptr }}, &err);
+    c.dbus_message_unref(reply);
+}
+
+pub fn setTrusted(conn: dbus.Connection, dev: Device, on: bool) !void {
+    var err = dbus.Error{};
+    try conn.setBoolProperty(dev.path.ptr, "org.bluez.Device1", "Trusted", on, &err);
+}
+
+pub fn powerOn(conn: dbus.Connection) !void {
+    var err = dbus.Error{};
+    try conn.setBoolProperty(adapter_path, "org.bluez.Adapter1", "Powered", true, &err);
+}
+
+/// Non-blocking: `Connect` can take many seconds. The caller polls the
+/// returned `dbus.Pending` from the frame loop instead of blocking on it.
+pub fn connectAsync(conn: dbus.Connection, dev: Device) !dbus.Pending {
+    return conn.callAsync("org.bluez", dev.path.ptr, "org.bluez.Device1", "Connect");
+}
+
+/// Non-blocking: `Pair` can take many seconds, and needs an agent registered
+/// (see `registerAgent`) or it fails with org.bluez.Error.AuthenticationFailed.
+pub fn pairAsync(conn: dbus.Connection, dev: Device) !dbus.Pending {
+    return conn.callAsync("org.bluez", dev.path.ptr, "org.bluez.Device1", "Pair");
+}
+
+pub const agent_path = "/muos/btui/agent";
+
+/// Set by `registerAgent`. `dbus_message_get_connection` does not exist in
+/// libdbus, so the connection the agent replies on has to be captured here
+/// instead of recovered from the incoming message.
+var agent_conn: ?*c.DBusConnection = null;
+
+fn agentMessage(_: ?*c.DBusConnection, msg: ?*c.DBusMessage, _: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
+    const member = c.dbus_message_get_member(msg);
+    // Every method we accept returns an empty reply; rejecting is never needed
+    // for NoInputNoOutput pairing.
+    if (c.strcmp(member, "RequestConfirmation") == 0 or
+        c.strcmp(member, "RequestAuthorization") == 0 or
+        c.strcmp(member, "AuthorizeService") == 0 or
+        c.strcmp(member, "Release") == 0 or
+        c.strcmp(member, "Cancel") == 0)
+    {
+        const reply = c.dbus_message_new_method_return(msg);
+        _ = c.dbus_connection_send(agent_conn, reply, null);
+        c.dbus_message_unref(reply);
+        return c.DBUS_HANDLER_RESULT_HANDLED;
+    }
+    return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+var agent_vtable = c.DBusObjectPathVTable{
+    .unregister_function = null,
+    .message_function = agentMessage,
+};
+
+/// Registers a NoInputNoOutput agent and makes it the default. BlueZ never
+/// asks this agent for a PIN or confirmation - it auto-accepts just-works
+/// pairing, which is what every gamepad and headset uses. Without an agent
+/// registered at all, `Device1.Pair` fails outright.
+pub fn registerAgent(conn: dbus.Connection) !void {
+    agent_conn = conn.handle;
+    _ = c.dbus_connection_register_object_path(conn.handle, agent_path, &agent_vtable, null);
+    var err = dbus.Error{};
+    const r1 = try conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", &.{ .{ .obj = agent_path }, .{ .str = "NoInputNoOutput" } }, &err);
+    c.dbus_message_unref(r1);
+    const r2 = try conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", &.{.{ .obj = agent_path }}, &err);
+    c.dbus_message_unref(r2);
+}

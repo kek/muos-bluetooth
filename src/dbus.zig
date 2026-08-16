@@ -25,6 +25,38 @@ pub const Error = extern struct {
 
 pub const DBusFailure = error{ ConnectFailed, CallFailed };
 
+/// A method-call argument. Variants (e.g. the boolean in a property `Set`)
+/// aren't representable here - see `Connection.setBoolProperty`.
+pub const Arg = union(enum) {
+    str: [*c]const u8,
+    obj: [*c]const u8,
+    boolean: bool,
+};
+
+/// A `Connect`/`Pair` call handed off to be polled from the frame loop
+/// instead of blocking on it. See `Connection.callAsync`.
+pub const Pending = struct {
+    call: ?*c.DBusPendingCall,
+
+    pub fn done(self: Pending) bool {
+        return c.dbus_pending_call_get_completed(self.call) != 0;
+    }
+
+    /// Consumes the pending call. Returns the reply, which may itself be an
+    /// error message - check with `errorName`.
+    pub fn take(self: Pending) ?*c.DBusMessage {
+        const reply = c.dbus_pending_call_steal_reply(self.call);
+        c.dbus_pending_call_unref(self.call);
+        return reply;
+    }
+};
+
+/// Null unless the reply is a D-Bus error, e.g. "org.bluez.Error.AuthenticationFailed".
+pub fn errorName(reply: *c.DBusMessage) ?[*c]const u8 {
+    if (c.dbus_message_get_type(reply) != c.DBUS_MESSAGE_TYPE_ERROR) return null;
+    return c.dbus_message_get_error_name(reply);
+}
+
 pub const Connection = struct {
     handle: ?*c.DBusConnection,
 
@@ -40,6 +72,78 @@ pub const Connection = struct {
         defer c.dbus_message_unref(msg);
         const reply = c.dbus_connection_send_with_reply_and_block(self.handle, msg, 5000, err.ptr());
         return reply orelse DBusFailure.CallFailed;
+    }
+
+    /// Like `call`, but appends `args` to the outgoing message. Needed for
+    /// calls that take parameters: `RemoveDevice`, agent registration, etc.
+    pub fn callArgs(
+        self: Connection,
+        dest: [*c]const u8,
+        path: [*c]const u8,
+        iface: [*c]const u8,
+        method: [*c]const u8,
+        args: []const Arg,
+        err: *Error,
+    ) DBusFailure!*c.DBusMessage {
+        const msg = c.dbus_message_new_method_call(dest, path, iface, method);
+        defer c.dbus_message_unref(msg);
+        var it: c.DBusMessageIter = undefined;
+        c.dbus_message_iter_init_append(msg, &it);
+        for (args) |a| switch (a) {
+            .str => |s| _ = c.dbus_message_iter_append_basic(&it, c.DBUS_TYPE_STRING, @ptrCast(&s)),
+            .obj => |s| _ = c.dbus_message_iter_append_basic(&it, c.DBUS_TYPE_OBJECT_PATH, @ptrCast(&s)),
+            .boolean => |b| {
+                var v: c.dbus_bool_t = if (b) 1 else 0;
+                _ = c.dbus_message_iter_append_basic(&it, c.DBUS_TYPE_BOOLEAN, @ptrCast(&v));
+            },
+        };
+        const reply = c.dbus_connection_send_with_reply_and_block(self.handle, msg, 30000, err.ptr());
+        return reply orelse DBusFailure.CallFailed;
+    }
+
+    /// Sets a boolean D-Bus property via org.freedesktop.DBus.Properties.Set.
+    /// The value must go inside a variant container, which `Arg`/`callArgs`
+    /// cannot express, so this builds the message by hand.
+    pub fn setBoolProperty(
+        self: Connection,
+        path: [*c]const u8,
+        iface: [*c]const u8,
+        name: [*c]const u8,
+        value: bool,
+        err: *Error,
+    ) DBusFailure!void {
+        const msg = c.dbus_message_new_method_call("org.bluez", path, "org.freedesktop.DBus.Properties", "Set");
+        defer c.dbus_message_unref(msg);
+        var it: c.DBusMessageIter = undefined;
+        c.dbus_message_iter_init_append(msg, &it);
+        _ = c.dbus_message_iter_append_basic(&it, c.DBUS_TYPE_STRING, @ptrCast(&iface));
+        _ = c.dbus_message_iter_append_basic(&it, c.DBUS_TYPE_STRING, @ptrCast(&name));
+        var variant: c.DBusMessageIter = undefined;
+        _ = c.dbus_message_iter_open_container(&it, c.DBUS_TYPE_VARIANT, "b", &variant);
+        var v: c.dbus_bool_t = if (value) 1 else 0;
+        _ = c.dbus_message_iter_append_basic(&variant, c.DBUS_TYPE_BOOLEAN, @ptrCast(&v));
+        _ = c.dbus_message_iter_close_container(&it, &variant);
+        const reply = c.dbus_connection_send_with_reply_and_block(self.handle, msg, 5000, err.ptr());
+        if (reply) |r| c.dbus_message_unref(r) else return DBusFailure.CallFailed;
+    }
+
+    /// Non-blocking variant of `call`: sends the message and returns a
+    /// `Pending` immediately instead of blocking for the reply. Used for
+    /// `Connect`/`Pair`, which can take many seconds - blocking on them would
+    /// freeze the frame loop.
+    pub fn callAsync(
+        self: Connection,
+        dest: [*c]const u8,
+        path: [*c]const u8,
+        iface: [*c]const u8,
+        method: [*c]const u8,
+    ) DBusFailure!Pending {
+        const msg = c.dbus_message_new_method_call(dest, path, iface, method);
+        defer c.dbus_message_unref(msg);
+        var pending: ?*c.DBusPendingCall = null;
+        if (c.dbus_connection_send_with_reply(self.handle, msg, &pending, 60000) == 0)
+            return DBusFailure.CallFailed;
+        return .{ .call = pending orelse return DBusFailure.CallFailed };
     }
 
     /// Non-blocking: process any pending incoming messages. Call once per frame.
