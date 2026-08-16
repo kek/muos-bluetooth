@@ -4,6 +4,7 @@ const c = @cImport({
     @cDefine("SDL_DISABLE_ARM_NEON_H", "1");
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_ttf.h");
+    @cInclude("stdio.h");
 });
 const theme = @import("theme.zig");
 
@@ -53,7 +54,7 @@ fn openPad() struct { controller: ?*c.SDL_GameController, joystick: ?*c.SDL_Joys
 /// this file is built on top of it. Deliberately independent of `init` -
 /// no font, no joystick - so a failure here isolates to SDL itself.
 pub fn windowTest() !void {
-    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK) != 0) {
+    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlInit;
     }
@@ -78,7 +79,7 @@ pub fn windowTest() !void {
 }
 
 pub fn init(font_path: [:0]const u8) !Ui {
-    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK) != 0) {
+    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlInit;
     }
@@ -149,6 +150,11 @@ const Glyphs = struct { tex: *c.SDL_Texture, w: c_int, h: c_int };
 
 /// Renders `s` to a texture. Caller owns and must destroy the returned
 /// texture; the intermediate surface is freed here regardless of outcome.
+/// Both failure paths print the SDL/TTF error text rather than failing
+/// silently - a frame where every glyph fails to draw must not look like a
+/// perfect frame in the console output (see task-7-report.md's fix-round-1
+/// notes: silence here previously made "no error output" worthless as
+/// evidence that text was actually rendered).
 fn render(self: Ui, s: [:0]const u8, colour: u32) ?Glyphs {
     const col = c.SDL_Color{
         .r = @intCast((colour >> 16) & 0xFF),
@@ -156,9 +162,15 @@ fn render(self: Ui, s: [:0]const u8, colour: u32) ?Glyphs {
         .b = @intCast(colour & 0xFF),
         .a = 0xFF,
     };
-    const surf = c.TTF_RenderUTF8_Blended(self.font, s.ptr, col) orelse return null;
+    const surf = c.TTF_RenderUTF8_Blended(self.font, s.ptr, col) orelse {
+        std.debug.print("TTF_RenderUTF8_Blended failed: {s}\n", .{c.TTF_GetError()});
+        return null;
+    };
     defer c.SDL_FreeSurface(surf);
-    const tex = c.SDL_CreateTextureFromSurface(self.renderer, surf) orelse return null;
+    const tex = c.SDL_CreateTextureFromSurface(self.renderer, surf) orelse {
+        std.debug.print("SDL_CreateTextureFromSurface failed: {s}\n", .{c.SDL_GetError()});
+        return null;
+    };
     return .{ .tex = tex, .w = surf.*.w, .h = surf.*.h };
 }
 
@@ -208,6 +220,17 @@ pub fn listRow(self: Ui, index: usize, selected: bool, left: [:0]const u8, right
 /// events underneath a mapped controller. So the raw cases below are only
 /// live when `self.controller == null` (no mapping was found), or the two
 /// paths would double-fire on every press.
+///
+/// Deliberately NOT falling back to the raw path when a controller is open
+/// but has never produced an event (fix-round-1 considered this after the
+/// missing SDL_INIT_GAMECONTROLLER defect - see task-7-report.md). The
+/// defect's actual root cause was the subsystem never being initialised, a
+/// one-line fix with no ambiguity; a "no event yet, so fall back" heuristic
+/// would instead need to guess a wait threshold, and picking one wrong
+/// either delays real input on a slow first frame or masks a genuine future
+/// regression in the controller path by quietly limping along on the raw
+/// one - a worse failure mode than the current loud "nothing happens at
+/// all" for a class of bug that init() already fully closes.
 pub fn poll(self: Ui) ?Button {
     var ev: c.SDL_Event = undefined;
     while (c.SDL_PollEvent(&ev) != 0) {
@@ -267,7 +290,7 @@ pub fn poll(self: Ui) ?Button {
 /// Task 8's UI testing is expected to re-run this once with the device in
 /// hand to confirm it live.
 pub fn inputTest(timeout_ms: u32) !void {
-    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK) != 0) {
+    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_JOYSTICK | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.debug.print("SDL_Init failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlInit;
     }
@@ -303,9 +326,50 @@ pub fn inputTest(timeout_ms: u32) !void {
     }
 }
 
+/// Path `--ui-test` dumps its one screenshot to. Raw RGBA8888, no header,
+/// screen_w * screen_h * 4 bytes - convert with e.g.
+/// `convert -size 640x480 -depth 8 rgba:btui_ui_test.rgba out.png`.
+pub const screenshot_path = "/tmp/btui_ui_test.rgba";
+
+/// Reads the renderer's current backbuffer via SDL_RenderReadPixels and
+/// writes it as raw RGBA8888 to `path`. This bypasses /dev/fb0 entirely -
+/// fbgrab reads a buffer this device's mali driver never writes to (see
+/// task-7-report.md), but SDL_RenderReadPixels reads the renderer's own
+/// backing store directly, so it works regardless of what fbgrab sees.
+///
+/// Must be called after drawing the frame's contents but BEFORE endFrame's
+/// SDL_RenderPresent: some accelerated backends use swap semantics on
+/// present (the "back" buffer just drawn becomes the new "front" buffer, or
+/// is invalidated outright) rather than a copy, so reading after the flip
+/// can return stale or undefined content on some drivers. Reading before
+/// the flip is the documented-safe point on every backend.
+pub fn screenshot(self: Ui, gpa: std.mem.Allocator, path: [:0]const u8) !void {
+    const pitch: usize = @intCast(screen_w * 4);
+    const buf = try gpa.alloc(u8, pitch * @as(usize, @intCast(screen_h)));
+    defer gpa.free(buf);
+
+    var rect = c.SDL_Rect{ .x = 0, .y = 0, .w = screen_w, .h = screen_h };
+    // ABGR8888 is SDL's name for the format whose in-memory byte order on a
+    // little-endian machine (this device's aarch64) is R,G,B,A - i.e. what
+    // ImageMagick's `rgba:` raw importer and every other "RGBA bytes" reader
+    // expects.
+    if (c.SDL_RenderReadPixels(self.renderer, &rect, c.SDL_PIXELFORMAT_ABGR8888, buf.ptr, @intCast(pitch)) != 0) {
+        std.debug.print("SDL_RenderReadPixels failed: {s}\n", .{c.SDL_GetError()});
+        return error.ReadPixels;
+    }
+
+    const f = c.fopen(path.ptr, "wb") orelse return error.FileOpen;
+    defer _ = c.fclose(f);
+    if (c.fwrite(buf.ptr, 1, buf.len, f) != buf.len) return error.ShortWrite;
+}
+
 /// Renders five dummy rows with row 2 selected, for `timeout_ms`, so the
-/// list layout and theme colours can be checked on the real screen.
-pub fn uiTest(font_path: [:0]const u8, timeout_ms: u32) !void {
+/// list layout and theme colours can be checked on the real screen. Dumps
+/// one screenshot (see `screenshot_path`) after the first frame is drawn,
+/// so the layout can be checked in software instead of needing eyes on the
+/// device (see task-7-report.md's fix-round-1 notes on fbgrab being blind
+/// to this driver's output).
+pub fn uiTest(font_path: [:0]const u8, gpa: std.mem.Allocator, timeout_ms: u32) !void {
     const ui = try init(font_path);
     defer deinit(ui);
 
@@ -313,6 +377,7 @@ pub fn uiTest(font_path: [:0]const u8, timeout_ms: u32) !void {
     const labels = [_][:0]const u8{ "Row Alpha", "Row Bravo", "Row Charlie", "Row Delta", "Row Echo" };
     const statuses = [_][:0]const u8{ "-", "paired", "connected", "-", "-" };
 
+    var shot_taken = false;
     var elapsed: u32 = 0;
     while (elapsed < timeout_ms) : (elapsed += 16) {
         while (poll(ui)) |btn| {
@@ -321,6 +386,12 @@ pub fn uiTest(font_path: [:0]const u8, timeout_ms: u32) !void {
         beginFrame(ui, pal);
         for (labels, 0..) |label, i| {
             listRow(ui, i, i == 2, label, statuses[i], pal);
+        }
+        if (!shot_taken) {
+            screenshot(ui, gpa, screenshot_path) catch |e| {
+                std.debug.print("screenshot failed: {s}\n", .{@errorName(e)});
+            };
+            shot_taken = true;
         }
         endFrame(ui);
         c.SDL_Delay(16);

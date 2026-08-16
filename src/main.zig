@@ -220,7 +220,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (hasFlag(init.args, "--ui-test")) {
         const font_path = testFontPath(gpa) orelse return;
         defer gpa.free(font_path);
-        ui.uiTest(font_path, 8_000) catch |e| {
+        ui.uiTest(font_path, gpa, 8_000) catch |e| {
             _ = c.printf("ui test failed: %s\n", @errorName(e).ptr);
         };
         return;
