@@ -11,6 +11,7 @@ const dbus = @import("dbus.zig");
 const bluez = @import("bluez.zig");
 const audio = @import("audio.zig");
 const theme = @import("theme.zig");
+const ui = @import("ui.zig");
 
 pub const version = "0.1.0";
 
@@ -181,13 +182,55 @@ fn forgetMode(gpa: std.mem.Allocator, conn: dbus.Connection, address: []const u8
     printDevices(after);
 }
 
+/// Loads the active theme's font path for a UI test mode, printing and
+/// bailing out on failure rather than propagating - these modes are manual,
+/// on-device checks, not something another mode calls into.
+fn testFontPath(gpa: std.mem.Allocator) ?[:0]u8 {
+    const name = theme.activeName(gpa) catch |e| {
+        _ = c.printf("theme lookup failed: %s\n", @errorName(e).ptr);
+        return null;
+    };
+    defer gpa.free(name);
+    return theme.fontPath(gpa, name) catch |e| {
+        _ = c.printf("font lookup failed: %s\n", @errorName(e).ptr);
+        return null;
+    };
+}
+
 pub fn main(init: std.process.Init.Minimal) void {
+    const gpa = std.heap.page_allocator;
+
+    // SDL/UI test modes are self-contained and deliberately checked before
+    // the D-Bus connect below: Step 1 of Task 7 proves a window opens at all,
+    // independent of anything else in the program.
+    if (hasFlag(init.args, "--window-test")) {
+        ui.windowTest() catch |e| {
+            _ = c.printf("window test failed: %s\n", @errorName(e).ptr);
+        };
+        return;
+    }
+
+    if (hasFlag(init.args, "--input-test")) {
+        ui.inputTest(20_000) catch |e| {
+            _ = c.printf("input test failed: %s\n", @errorName(e).ptr);
+        };
+        return;
+    }
+
+    if (hasFlag(init.args, "--ui-test")) {
+        const font_path = testFontPath(gpa) orelse return;
+        defer gpa.free(font_path);
+        ui.uiTest(font_path, 8_000) catch |e| {
+            _ = c.printf("ui test failed: %s\n", @errorName(e).ptr);
+        };
+        return;
+    }
+
     var err = dbus.Error{};
     const conn = dbus.connectSystem(&err) catch {
         _ = c.printf("bus connect failed: %s\n", err.text());
         return;
     };
-    const gpa = std.heap.page_allocator;
 
     if (hasFlag(init.args, "--dump")) {
         dumpMode(gpa, conn) catch |e| {
