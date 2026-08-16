@@ -9,6 +9,7 @@ const c = @cImport({
 });
 const dbus = @import("dbus.zig");
 const bluez = @import("bluez.zig");
+const audio = @import("audio.zig");
 
 pub const version = "0.1.0";
 
@@ -46,12 +47,29 @@ fn findByAddress(devices: []bluez.Device, address: []const u8) ?bluez.Device {
     return null;
 }
 
+fn printSinks(gpa: std.mem.Allocator) void {
+    const list = audio.sinks(gpa) catch |e| {
+        _ = c.printf("sinks failed: %s\n", @errorName(e).ptr);
+        return;
+    };
+    defer audio.freeSinks(gpa, list);
+
+    // s.name/description come from parseSinks' gpa.dupe, so they are plain
+    // slices with no null terminator: %.*s (length from the argument) rather
+    // than %s (which would read past the allocation looking for one).
+    _ = c.printf("sinks: %d\n", @as(c_int, @intCast(list.len)));
+    for (list) |s| {
+        _ = c.printf("  %-4d %.*s (%.*s) bt=%d%s\n", s.id, @as(c_int, @intCast(s.name.len)), s.name.ptr, @as(c_int, @intCast(s.description.len)), s.description.ptr, @as(c_int, @intFromBool(s.is_bluetooth)), @as([*:0]const u8, if (s.is_default) " *" else ""));
+    }
+}
+
 /// `--dump` is the project's main development feedback loop: it prints the
 /// device list over SSH with no UI involved.
 fn dumpMode(gpa: std.mem.Allocator, conn: dbus.Connection) !void {
     const devices = try bluez.list(gpa, conn);
     defer bluez.freeList(gpa, devices);
     printDevices(devices);
+    printSinks(gpa);
 }
 
 /// Starts discovery, gives the adapter a few seconds to hear back from

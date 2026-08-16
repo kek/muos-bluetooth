@@ -5,3 +5,7 @@ const std = @import("std");
 test "test harness runs" {
     try std.testing.expect(true);
 }
+
+test {
+    _ = @import("audio.zig");
+}
