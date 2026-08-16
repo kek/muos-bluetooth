@@ -4,7 +4,6 @@ const std = @import("std");
 pub const c = @cImport({
     @cInclude("dbus/dbus.h");
     @cInclude("string.h");
-    @cInclude("stdio.h");
 });
 
 /// dbus.h's DBusError contains bitfields, so translate-c renders it opaque and

@@ -3,6 +3,12 @@ const std = @import("std");
 const dbus = @import("dbus.zig");
 const c = dbus.c;
 
+// Only for the agent-callback logging below - kept separate from `c`
+// (`dbus.c`) so the D-Bus wrapper itself stays about D-Bus, not stdio.
+const libc = @cImport({
+    @cInclude("stdio.h");
+});
+
 pub const Device = struct {
     path: [:0]u8,
     address: [:0]u8,
@@ -155,6 +161,17 @@ pub fn disconnect(conn: dbus.Connection, dev: Device, err: *dbus.Error) !void {
     return deviceCall(conn, dev, "Disconnect", err);
 }
 
+/// Blocking, prompt-returning - same class as `disconnect`. Tells
+/// `bluetoothd` to actually stop an in-flight `Pair`, unlike dropping our
+/// own `dbus.Pending` (`Pending.deinit` only releases *our* D-Bus call and
+/// tells BlueZ nothing): without this, a user who backs out of pairing
+/// would still end up with a device BlueZ finishes pairing anyway, since
+/// our own agent stays registered and auto-accepts whatever `bluetoothd`
+/// asks while it completes in the background.
+pub fn cancelPairing(conn: dbus.Connection, dev: Device, err: *dbus.Error) !void {
+    return deviceCall(conn, dev, "CancelPairing", err);
+}
+
 pub fn startScan(conn: dbus.Connection, err: *dbus.Error) !void {
     const reply = try conn.call("org.bluez", adapter_path, "org.bluez.Adapter1", "StartDiscovery", err);
     c.dbus_message_unref(reply);
@@ -210,13 +227,20 @@ fn firstPathArg(msg: ?*c.DBusMessage) [*c]const u8 {
 }
 
 /// Logs every callback (method name + the device it concerns) and the reply
-/// send, on stdout via `c.printf` like the rest of the file - this agent is
-/// the single largest untested surface in the project (see task-8-report.md),
-/// so a real pairing session needs evidence in the transcript that these
-/// fired at all, not just silent auto-accept.
+/// send - this agent is the single largest untested surface in the project
+/// (see task-8-report.md), so a real pairing session needs evidence in the
+/// transcript that these fired at all, not just silent auto-accept.
+///
+/// Flushed explicitly after every line: under muOS the packaged app's
+/// stdout is redirected to a file and therefore fully buffered rather than
+/// line-buffered, so on an abort (see the live `Pending.deinit` crash this
+/// project already hit once) unflushed diagnostic lines are exactly the
+/// ones lost - the hardware session that first proved this logging worked
+/// only saw it because it happened to run on a tty.
 fn agentMessage(_: ?*c.DBusConnection, msg: ?*c.DBusMessage, _: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
     const member = c.dbus_message_get_member(msg);
-    _ = c.printf("agent: %s %s\n", member, firstPathArg(msg));
+    _ = libc.printf("agent: %s %s\n", member, firstPathArg(msg));
+    _ = libc.fflush(null);
 
     // Every method we accept returns an empty reply; rejecting is never needed
     // for NoInputNoOutput pairing.
@@ -229,7 +253,8 @@ fn agentMessage(_: ?*c.DBusConnection, msg: ?*c.DBusMessage, _: ?*anyopaque) cal
         const reply = c.dbus_message_new_method_return(msg);
         _ = c.dbus_connection_send(agent_conn, reply, null);
         c.dbus_message_unref(reply);
-        _ = c.printf("agent: %s reply sent\n", member);
+        _ = libc.printf("agent: %s reply sent\n", member);
+        _ = libc.fflush(null);
         return c.DBUS_HANDLER_RESULT_HANDLED;
     }
     return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -251,11 +276,13 @@ pub fn registerAgent(conn: dbus.Connection) !void {
     var err = dbus.Error{};
     defer err.deinit();
     const r1 = conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RegisterAgent", &.{ .{ .obj = agent_path }, .{ .str = "NoInputNoOutput" } }, &err) catch |e| {
-        _ = c.printf("agent: RegisterAgent failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        _ = libc.printf("agent: RegisterAgent failed: %s (%s)\n", @errorName(e).ptr, err.text());
+        _ = libc.fflush(null);
         return e;
     };
     c.dbus_message_unref(r1);
-    _ = c.printf("agent: RegisterAgent succeeded\n");
+    _ = libc.printf("agent: RegisterAgent succeeded\n");
+    _ = libc.fflush(null);
 
     // Best-effort: BlueZ routes a client's own Pair() calls to whichever
     // agent that same connection registered, so being *default* is not
@@ -268,8 +295,9 @@ pub fn registerAgent(conn: dbus.Connection) !void {
     defer err2.deinit();
     if (conn.callArgs("org.bluez", "/org/bluez", "org.bluez.AgentManager1", "RequestDefaultAgent", &.{.{ .obj = agent_path }}, &err2)) |r2| {
         c.dbus_message_unref(r2);
-        _ = c.printf("agent: RequestDefaultAgent succeeded\n");
+        _ = libc.printf("agent: RequestDefaultAgent succeeded\n");
     } else |e| {
-        _ = c.printf("agent: RequestDefaultAgent failed (best-effort, ignored): %s (%s)\n", @errorName(e).ptr, err2.text());
+        _ = libc.printf("agent: RequestDefaultAgent failed (best-effort, ignored): %s (%s)\n", @errorName(e).ptr, err2.text());
     }
+    _ = libc.fflush(null);
 }

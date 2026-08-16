@@ -335,7 +335,19 @@ fn refreshDevices(app: *App) void {
 /// discovery on the same adapter), captures `resume_mode`, and enters
 /// `.working`. An immediate (synchronous) failure to even issue the call
 /// routes through `fail` like every other failure site.
+///
+/// Safe to call in isolation (final review, finding M4): guards
+/// `app.selected` against an empty/out-of-range `app.devices` rather than
+/// trusting every caller to have checked first, and releases any `Pending`
+/// already sitting in `app.pending` before overwriting it - both
+/// preconditions happen to hold at the one call site today, but a helper
+/// with "the caller must have already checked" preconditions is exactly how
+/// this file's worst bugs have shown up so far.
 fn beginAsync(app: *App, kind: PendingKind) void {
+    if (app.selected >= app.devices.len) return;
+    if (app.pending) |*p| p.deinit();
+    app.pending = null;
+
     const dev = app.devices[app.selected];
     if (app.mode == .scanning) {
         var stop_err = dbus.Error{};
@@ -458,10 +470,31 @@ fn handleInput(app: *App, btn: ui.Button) void {
         // action (like starting a scan, which reallocates `app.devices`)
         // against a `Pending` that still references the old device by index.
         if (btn == .b) {
+            // Final review, finding I1: `Pending.deinit` only cancels *our*
+            // D-Bus call - it tells `bluetoothd` nothing, so a bare cancel
+            // here left the device pairing anyway (our own agent, still
+            // registered, auto-accepts whatever finishes it in the
+            // background). `CancelPairing` actually tells BlueZ to stop.
+            // Best-effort: if it fails, `deinit` below still releases our
+            // side, and the row will just show whatever state BlueZ landed
+            // on once refreshed.
+            if (app.pending_kind == .pair and app.pending_index < app.devices.len) {
+                var cancel_err = dbus.Error{};
+                defer cancel_err.deinit();
+                bluez.cancelPairing(app.conn, app.devices[app.pending_index], &cancel_err) catch {
+                    _ = c.printf("cancelPairing failed (best-effort): %s\n", cancel_err.text());
+                };
+            }
             if (app.pending) |*p| p.deinit();
             app.pending = null;
             app.retry_scheduled = false;
-            app.mode = app.resume_mode;
+            // Finding I2: leaving `.working` must always refresh, not just
+            // on connect-success - otherwise a cancelled-but-completed pair
+            // leaves the row reading unpaired while BlueZ now disagrees,
+            // and `a` re-routes into `Pair` again (AlreadyExists) with no
+            // way out except `y`, which the footer doesn't advertise.
+            refreshDevices(app);
+            if (app.mode == .working) app.mode = app.resume_mode;
         }
         return;
     }
@@ -486,6 +519,17 @@ fn updatePending(app: *App) void {
     if (app.pending) |*p| {
         if (!p.done()) return;
         const reply = p.take();
+        // Final review, finding M1: `take()` was hardened to return null
+        // rather than assert/abort when the call it's asked to steal from
+        // isn't actually complete (see the live `Pending.deinit` crash this
+        // project already hit once) - but that only matters if this caller
+        // actually honours it. `done()` just returned true above, so
+        // `p.call` should already be null here; if it somehow isn't, this
+        // was called too early and the `Pending` is still live and owned -
+        // leave it alone and retry next frame rather than dropping it via
+        // an unconditional `app.pending = null`, which would leak the
+        // underlying `DBusPendingCall`.
+        if (p.call != null) return;
         app.pending = null;
 
         const r = reply orelse {
@@ -499,7 +543,11 @@ fn updatePending(app: *App) void {
             if (!app.pending_retried and isTransient(name, detail)) {
                 app.pending_retried = true;
                 app.retry_scheduled = true;
-                app.retry_at_ms = ticks + connect_retry_delay_ms;
+                // Finding M5: unchecked `u32` add is UB at the tick
+                // rollover under ReleaseSmall (no overflow trap). `+%`
+                // makes the wraparound defined instead of relying on
+                // whatever LLVM happens to emit for the checked op.
+                app.retry_at_ms = ticks +% connect_retry_delay_ms;
             } else {
                 fail(app, detail);
             }
@@ -521,6 +569,11 @@ fn updatePending(app: *App) void {
                     _ = c.printf("setTrusted failed (continuing to connect anyway): %s\n", trust_err.text());
                 };
                 const pending2 = bluez.connectAsync(app.conn, dev) catch |e| {
+                    // Finding I2: the device is genuinely paired now even
+                    // though this connect attempt never got off the
+                    // ground - refresh so the row reflects that instead of
+                    // still reading unpaired.
+                    refreshDevices(app);
                     fail(app, @errorName(e).ptr);
                     return;
                 };
