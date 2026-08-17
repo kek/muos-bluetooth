@@ -60,6 +60,20 @@ That copies `init/10-bluetooth.sh` to `/mnt/mmc/MUOS/init/`, the helpers to
 `/mnt/mmc/MUOS/bluetooth/`, the `btui` app to `/mnt/mmc/MUOS/application/Bluetooth/`,
 and sets `user_init` to `1`. Reboot afterwards.
 
+If the app was installed, `install.sh` also makes a best-effort attempt at an
+Applications-menu icon for it. muOS ships no icon named `bluetooth` under any
+theme, so nothing is vendored here either: for each installed theme that has a
+`glyph/muxapp/` directory and doesn't already have a `bluetooth.png` in it, the
+script copies *that same theme's own* Bluetooth artwork in - whichever of
+`glyph/muxdevice/bluetooth.png`, `glyph/muxconnect/bluetooth.png`, or
+`glyph/header/bluetooth.png` it finds first. Themes with no `glyph/muxapp/` at
+all (most of them, on the one device this was tested on - only the default
+`MustardOS` theme had one) or no Bluetooth glyph to borrow are left alone,
+icon-less; `btui` works fully either way, this is cosmetic only.
+**Switching themes, or updating one, drops the copied icon** - it lives inside
+the theme's own directory, so anything that replaces that directory takes it
+with it. Re-running `install.sh` puts it back on any theme that qualifies.
+
 Doing it by hand is the same three steps:
 
 1. Copy `init/10-bluetooth.sh` to `/mnt/mmc/MUOS/init/10-bluetooth.sh`.
